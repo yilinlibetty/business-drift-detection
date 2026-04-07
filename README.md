@@ -1,84 +1,234 @@
-# Automated Business Process Drift Detection & LLM Root Cause Analysis
+﻿# Business Drift Detection with Evidence-Driven LLM Diagnosis
 
-本项目实现了一个端到端流程：
-1. 对业务流程事件日志进行漂移检测（结构漂移 + 时长漂移）
-2. 输出结构化 JSON 证据
-3. 交给大模型自动生成中文诊断报告（Markdown）
+本项目实现了一个从事件日志到业务诊断报告的完整流程，目标不是只回答“有没有 drift”，而是进一步回答：
 
-适用于毕业设计、流程挖掘课程实验、以及流程监控原型验证。
+- 漂移发生在时间线上的哪些区段
+- 每个漂移点的主要变化是什么
+- 哪些证据支持这些变化
+- 候选根因是什么
+- 有哪些后续改进建议和人工核验动作
 
----
-
-## 1. 项目目标
-
-传统漂移检测通常只能回答“有没有漂移”。本项目进一步回答：
-- 漂移有多强（量化分数）
-- 主要变化发生在哪些流程路径上
-- 可能根因是什么
-- 后续可执行改进建议是什么
+当前系统的正式口径是：**输出的是证据支持的候选根因，不是未经验证的事实根因。**
 
 ---
 
-## 2. 项目结构
+## 1. 项目定位
+
+这是一个面向业务流程事件日志的 drift detection 原型系统，适合：
+
+- 毕业设计 / 论文原型
+- 流程挖掘课程实验
+- BPM 监控与诊断 demo
+- “drift detection + LLM explanation” 方向的研究验证
+
+与传统只输出一个 `DRIFT DETECTED / STABLE` 的方案不同，这个项目会继续生成：
+
+- 漂移时间线
+- 逐漂移点证据包
+- 规则化候选根因标签
+- 逐点诊断结果
+- 总报告与人工核验模板
+
+---
+
+## 2. 当前方法概览
+
+主流程默认采用 **timeline mode**。
+
+### Step 1. 事件日志读取与标准化
+
+系统支持：
+
+- `.csv`
+- `.xes`
+- `.xml`
+
+最少需要三列：
+
+- `case id`
+- `activity`
+- `timestamp`
+
+读取逻辑位于：
+
+- `convert_data.py`
+
+### Step 2. Case 聚合
+
+系统会按 case 聚合出：
+
+- `Trace`：完整活动路径
+- `Duration`：case 总时长
+- `EventCount`
+- `RepeatedActivityCount`
+- `HasLoop`
+
+这一步把 event-level log 转成 case-level process behavior。
+
+### Step 3. 时间线双窗口比较
+
+系统不再使用固定前后 50/50 切分作为主模式，而是沿时间线构造相邻窗口：
+
+- `reference window`
+- `current window`
+
+对每一对窗口计算：
+
+- `trace_score`
+  - trace 分布距离
+  - 支持 `TV` 和 `L1`
+- `duration_score`
+  - case duration 的 Wasserstein 距离
+  - 再除以 `median(reference)` 做归一化
+- `final_score`
+  - 默认取 `max(trace_score, duration_score)`
+
+之后会对分数序列做 3 点中位数平滑。
+
+### Step 4. 漂移区段识别
+
+系统会基于阈值找出漂移窗口，然后合并成 `drift interval`。
+
+当前策略包括：
+
+- 超阈值窗口识别
+- 相邻激活窗口成组
+- 对彼此非常接近的组做二次合并，避免把同一个真实漂移切成多个点
+- 对每个区段选取峰值窗口作为 `drift point`
+
+输出字段包括：
+
+- `interval_start_time`
+- `interval_end_time`
+- `peak_time`
+- `peak_score`
+- `trace_score`
+- `duration_score`
+- `detection_delay_proxy`
+
+### Step 5. 证据提取
+
+每个漂移点都会生成结构化 evidence pack，至少包括：
+
+- `top_increased_traces`
+- `top_decreased_traces`
+- `top_changed_transitions`
+- `activity_frequency_deltas`
+- `rework_or_loop_rate_delta`
+- `duration_stats_delta`
+- `case_count`
+- `window_time_range`
+- `evidence_ids`
+
+如果日志里存在更多业务字段，还会追加可选维度分析：
+
+- `resource`
+- `team`
+- `priority`
+- `channel`
+- `region`
+
+### Step 6. 规则化候选根因标签
+
+在调用 LLM 之前，系统先根据证据打规则标签，例如：
+
+- `path_added`
+- `path_removed_or_skipped_step`
+- `delay_increase`
+- `loop_increase`
+- `handoff_or_escalation_increase`
+- `case_mix_shift`
+
+这一步的目的是：
+
+- 先给出确定性、可解释的候选方向
+- 限制 LLM 自由发挥
+- 让后续诊断更可控、更便于评估
+
+### Step 7. LLM 或 fallback 诊断
+
+如果配置了 LLM，系统会对每个漂移点单独做诊断；否则自动回退到规则驱动的 fallback 诊断。
+
+诊断输出统一为结构化 JSON，至少包括：
+
+- `summary`
+- `candidate_causes[]`
+- `recommendations[]`
+- `confidence`
+- `missing_data`
+
+### Step 8. 报告渲染
+
+最终系统会输出：
+
+- 一份总报告 `final_drift_report.md`
+- 一份人工核验模板 `human_review_rubric.md`
+- 一份完整结构化分析结果 `drift_analysis.json`
+
+---
+
+## 3. 项目结构
 
 ```text
-FYP/
-├─ run_full_pipeline.py              # 主流程：读取数据、构建Trace、检测漂移、输出JSON/Prompt
-├─ convert_data.py                   # 日志转换器：支持 CSV / XES 读取，XES 可转 CSV
-├─ final_llm_input_prompt.txt        # 主流程生成的给 LLM 的提示词（运行后更新）
-├─ requirements.txt                  # 运行依赖
-├─ README.md                         # 项目说明（本文件）
+business-drift-detection/
+├─ run_full_pipeline.py
+├─ convert_data.py
+├─ drift_detection/
+│  ├─ pipeline.py
+│  ├─ evidence.py
+│  ├─ llm_support.py
+│  └─ reporting.py
 ├─ datasets/
-│  ├─ finale.csv                     # 默认事件日志数据（Help Desk）
-│  ├─ frequency-log.xes              # XES 示例数据
-│  ├─ frequency-log.csv              # 由 XES 转换后的 CSV
-│  ├─ final_report_for_azure.json    # 主流程输出：漂移检测结果
-│  └─ llm_analyst_official.py        # LLM 分析脚本：读取 JSON，生成 Markdown 报告
-├─ examples/
-│  └─ Final_Drift_Analysis_Report.md # LLM 输出报告示例
-└─ archive/                          # 历史实验代码（非主线）
+│  ├─ finale.csv
+│  ├─ frequency-log.xes
+│  ├─ frequency-log.csv
+│  └─ llm_analyst_official.py
+├─ outputs/
+├─ archive/
+├─ requirements.txt
+└─ README.md
 ```
 
----
+各模块职责：
 
-## 3. 核心流程（主线）
-
-### Step A: 漂移检测（`run_full_pipeline.py`）
-
-主脚本完成以下工作：
-- 读取事件日志（默认 `datasets/finale.csv`，也支持 `.xes/.xml`）
-- 清洗并按 `Case ID` 聚合为 Trace
-- 按案例时间一分为二：前 50% 为 Baseline，后 50% 为 Current
-- 可选注入人工漂移（结构缺失 / 延迟 / 混合）
-- 计算漂移分数：
-  - 结构漂移：Trace 分布距离（TV 或 L1）
-  - 时长漂移：Wasserstein 距离并按基准中位数归一化
-  - 最终分数：根据模式取结构、时长或两者 max
-- 输出：
-  - `datasets/final_report_for_azure.json`
-  - `final_llm_input_prompt.txt`
-
-### Step B: 报告生成（`datasets/llm_analyst_official.py`）
-
-该脚本读取 `datasets/final_report_for_azure.json`，调用 OpenAI 兼容接口，生成中文 Markdown 报告：
-- 输出文件：`examples/Final_Drift_Analysis_Report.md`
-- 固定报告结构：`总览 / 关键变化 / 根因推断 / 改进建议`
+- `run_full_pipeline.py`
+  - CLI 入口
+  - 编排整个检测、诊断、输出流程
+- `drift_detection/pipeline.py`
+  - 时间线检测
+  - 阈值选择
+  - 区段合并
+  - 合成注入
+  - evaluation
+- `drift_detection/evidence.py`
+  - 证据提取
+  - 规则标签生成
+- `drift_detection/llm_support.py`
+  - LLM 调用
+  - fallback 诊断
+- `drift_detection/reporting.py`
+  - Markdown 报告
+  - 人工核验模板
+- `datasets/llm_analyst_official.py`
+  - 兼容 wrapper
+  - 读取已有 `drift_analysis.json` 重新渲染报告
 
 ---
 
 ## 4. 环境准备
 
-### 4.1 Python 版本
+建议使用：
 
-建议 `Python 3.10+`（本仓库环境验证过 `Python 3.12`）。
+- `Python 3.9+`
 
-### 4.2 安装依赖
+安装依赖：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-`requirements.txt` 当前包含：
+当前依赖：
+
 - pandas
 - numpy
 - scipy
@@ -86,209 +236,242 @@ pip install -r requirements.txt
 - openai
 - httpx
 
-说明：
-- 读取 XES 时 `pm4py` 是可选依赖；未安装时会走内置 XML 解析逻辑。
+补充说明：
+
+- 解析 XES/XML 时，`pm4py` 是可选依赖；没装也能跑。
+- 未配置 LLM 时，主流程不会报错，而会自动使用 fallback 诊断。
 
 ---
 
 ## 5. 快速开始
 
-### 5.1 运行检测主流程
-
-Windows + 项目自带虚拟环境示例：
+### 5.1 默认运行
 
 ```powershell
-.venv\Scripts\python.exe run_full_pipeline.py
+python run_full_pipeline.py
 ```
 
-成功后会看到：
-- 漂移分数输出（Trace / Duration / Final）
-- `datasets/final_report_for_azure.json` 写入成功
-- `final_llm_input_prompt.txt` 生成成功
+默认行为：
 
-### 5.2 运行评估模式（可选）
+- 使用 `timeline` 模式
+- 自动阈值开启
+- 若没有配置 `OPENAI_API_KEY`，自动使用 fallback 诊断
+
+### 5.2 不调用 LLM，只生成证据驱动报告
 
 ```powershell
-.venv\Scripts\python.exe run_full_pipeline.py --evaluate
+python run_full_pipeline.py --no-llm
 ```
 
-可选参数：
-
-```text
---eval-window <int>      # 默认 500
---eval-step <int>        # 默认 250
---eval-threshold <float> # 默认 DRIFT_THRESHOLD（0.05）
---auto-threshold         # 根据窗口评分自动选 best_threshold
---eval-seed <int>        # 默认 42
-```
-
-评估模式额外输出：
-- `datasets/evaluation_report.json`
-- 并把 `evaluation` 字段回写到 `datasets/final_report_for_azure.json`
-
-### 5.3 生成 LLM 分析报告
+### 5.3 运行多段合成漂移评估
 
 ```powershell
-.venv\Scripts\python.exe datasets\llm_analyst_official.py
+python run_full_pipeline.py --no-llm --inject-drift --drift-type mixed --drift-segments 2 --evaluate
 ```
 
-输出：
-- `examples/Final_Drift_Analysis_Report.md`
+补充说明：
 
----
+- 若启用合成注入但没有显式传 `--detection-mode`，纯 `structure` 注入默认用 `structure` 检测，纯 `delay` 注入默认用 `delay` 检测。
 
-## 6. 配置说明
-
-### 6.1 主脚本环境变量（`run_full_pipeline.py`）
-
-| 变量名 | 默认值 | 说明 |
-|---|---|---|
-| `EVENT_LOG_PATH` | `datasets/finale.csv` | 输入日志路径（支持 `.csv/.xes/.xml`） |
-| `COL_CASE_ID` | `Case ID` | 案例 ID 列名 |
-| `COL_ACTIVITY` | `Activity` | 活动列名 |
-| `COL_TIMESTAMP` | `Complete Timestamp` | 时间戳列名 |
-| `KEEP_ONLY_COMPLETE` | `true` | XES 解析时是否只保留 `lifecycle:transition=complete` |
-| `INJECT_DRIFT` | `false` | 是否在 Current 部分注入人工漂移 |
-| `DRIFT_SEED` | `42` | 注入/评估随机种子 |
-| `TOP_K_TRACES` | `10` | 报告中 Top-K 路径数量 |
-| `DRIFT_METRIC` | `tv` | 结构分布距离：`tv` 或 `l1` |
-| `DRIFT_THRESHOLD` | `0.05` | 漂移判定阈值 |
-| `DETECTION_MODE` | `structure` | `structure` / `delay` / `mixed` / `auto` |
-
-脚本中的固定参数（非环境变量）：
-- `DRIFT_TYPE = 'structure'`（注入类型）
-- `TARGET_ACTIVITY = 'Live Chat'`（延迟注入目标活动）
-
-### 6.2 常用运行示例
-
-#### 示例 A：切到 XES 数据并映射列名
+### 5.4 使用兼容 wrapper 重新渲染报告
 
 ```powershell
-$env:EVENT_LOG_PATH="datasets/frequency-log.xes"
-$env:COL_CASE_ID="case:concept:name"
-$env:COL_ACTIVITY="concept:name"
-$env:COL_TIMESTAMP="time:timestamp"
-.venv\Scripts\python.exe run_full_pipeline.py
-```
-
-#### 示例 B：启用人工漂移注入
-
-```powershell
-$env:INJECT_DRIFT="true"
-$env:DRIFT_SEED="42"
-.venv\Scripts\python.exe run_full_pipeline.py
-```
-
-#### 示例 C：切换检测模式和度量
-
-```powershell
-$env:DETECTION_MODE="mixed"
-$env:DRIFT_METRIC="l1"
-$env:DRIFT_THRESHOLD="0.08"
-.venv\Scripts\python.exe run_full_pipeline.py
+python datasets\llm_analyst_official.py --no-llm
 ```
 
 ---
 
-## 7. 输出文件说明
+## 6. 重要 CLI 参数
 
-### 7.1 `datasets/final_report_for_azure.json`
+### 分析相关
 
-核心字段：
-- `status`: `DRIFT DETECTED` / `STABLE`
-- `drift_score`: 最终判定分数
-- `trace_drift_score`: 结构漂移分数
-- `duration_drift_score`: 归一化时长漂移分数
-- `duration_drift_score_raw`: 原始 Wasserstein 距离
-- `drift_metric`: `tv` / `l1`
-- `detection_mode`: 判定模式
-- `detection_threshold`: 阈值
-- `analysis`:
-  - `baseline_count`, `current_count`
-  - `top_baseline_process_freq`, `top_current_process_freq`
-  - `top_baseline_process_count`, `top_current_process_count`
+- `--analysis-mode timeline|legacy-half-split`
+- `--legacy-half-split`
+- `--window-size <int>`
+- `--step-size <int>`
+- `--threshold <float>`
+- `--auto-threshold`
+- `--fixed-threshold`
+- `--top-k <int>`
+- `--drift-metric tv|l1`
+- `--detection-mode structure|delay|mixed|auto`
+- `--output-dir <path>`
 
-若启用 `--evaluate`，还会增加：
-- `evaluation`（包含混淆矩阵、precision/recall/f1、best_threshold 等）
+### LLM 相关
 
-### 7.2 `final_llm_input_prompt.txt`
+- `--llm-enabled`
+- `--no-llm`
 
-给大模型直接使用的完整 Prompt，包含：
-- 系统状态
-- 漂移分数
-- Baseline/Current Top-K 路径统计
-- 固定报告输出要求
+### 合成注入与评估相关
 
-### 7.3 `examples/Final_Drift_Analysis_Report.md`
-
-最终业务可读报告（中文 Markdown）。
-
----
-
-## 8. LLM 脚本配置与安全提示
-
-`datasets/llm_analyst_official.py` 中当前使用了脚本内配置项：
-- `API_KEY`
-- `MODEL_NAME`
-- `BASE_URL`
-
-建议在本地私有环境中使用，避免把真实密钥提交到仓库。推荐做法：
-1. 把密钥改为环境变量读取
-2. 把密钥文件加入 `.gitignore`
-3. 若密钥已暴露，立即在服务端轮换
+- `--inject-drift`
+- `--no-inject-drift`
+- `--drift-type structure|delay|mixed`
+- `--drift-segments <int>`
+- `--drift-segment-ratio <float>`
+- `--target-activity <name>`
+- `--drift-seed <int>`
+- `--evaluate`
 
 ---
 
-## 9. 常见问题（Troubleshooting）
+## 7. LLM 配置
 
-### 9.1 `ModuleNotFoundError: No module named 'pandas'`
+当前不允许在代码里硬编码密钥。
 
-原因：使用了系统 Python 而不是项目虚拟环境。  
-解决：
+请通过环境变量配置：
 
 ```powershell
-.venv\Scripts\python.exe run_full_pipeline.py
+$env:OPENAI_API_KEY="your_api_key"
+$env:OPENAI_BASE_URL="https://your-compatible-endpoint/v1"
+$env:OPENAI_MODEL="gpt-5.2"
 ```
 
-### 9.2 `Missing columns` 报错
+说明：
 
-原因：输入数据列名和默认映射不一致。  
-解决：设置 `COL_CASE_ID/COL_ACTIVITY/COL_TIMESTAMP` 环境变量为真实列名。
-
-### 9.3 LLM 脚本调用失败（网络/认证）
-
-可能原因：
-- API Key 无效
-- Base URL 不可访问
-- 网络限制
-
-解决：
-- 校验 `API_KEY` / `BASE_URL`
-- 先确认 `datasets/final_report_for_azure.json` 已生成
-- 再单独运行 `datasets/llm_analyst_official.py`
+- 没有 `OPENAI_API_KEY` 时，系统自动走 fallback。
+- `datasets/llm_analyst_official.py` 现在只是兼容入口，不再保存任何硬编码凭证。
 
 ---
 
-## 10. Archive 目录说明
+## 8. 输出文件说明
 
-`archive/` 为历史实验代码集合（模型验证、可视化、早期原型），例如：
-- `verify_model.py`: 合成数据验证检测灵敏度
-- `run_drift_test.py`: 基于 KS 检验的示例
-- `run_real_analysis.py`: 旧版真实数据分析脚本
+所有正式输出都写入 `outputs/`。
 
-主线复现建议优先使用：
-- `run_full_pipeline.py`
-- `datasets/llm_analyst_official.py`
+### 8.1 `outputs/drift_analysis.json`
+
+这是 canonical 输出，包含：
+
+- `run_metadata`
+- `config`
+- `global_summary`
+- `score_timeline`
+- `drift_points[]`
+- `ground_truth_intervals`
+- `evaluation`
+- `llm`
+
+每个 `drift_point` 至少包含：
+
+- `id`
+- `interval_start_time`
+- `interval_end_time`
+- `peak_time`
+- `peak_score`
+- `trace_score`
+- `duration_score`
+- `evidence`
+- `rule_based_tags`
+- `llm_diagnosis`
+
+### 8.2 `outputs/drift_score_timeline.csv`
+
+窗口级分数输出，适合画时间线图和调阈值，包含：
+
+- case 范围
+- reference/current 时间范围
+- `trace_score`
+- `duration_score`
+- `final_score_raw`
+- `final_score`
+- `threshold`
+- `is_drift_window`
+
+### 8.3 `outputs/final_drift_report.md`
+
+总报告，固定结构为：
+
+- 总览
+- 检测方法与阈值
+- 漂移时间线概览
+- 逐漂移点分析
+- 跨区段共性
+- 改进建议
+- Evaluation Snapshot（若存在）
+
+### 8.4 `outputs/human_review_rubric.md`
+
+人工核验模板，用于真实日志抽样评估：
+
+- 变化是否真实
+- 原因是否有证据支撑
+- 建议是否可执行
+
+### 8.5 `outputs/legacy_final_report_for_azure.json`
+
+兼容旧字段的简化 JSON，方便旧流程迁移。
 
 ---
 
-## 11. 一句话复现
+## 9. 评估指标
+
+当存在合成 ground truth，或启用 `--evaluate` 时，系统会输出：
+
+- `interval_level_precision`
+- `interval_level_recall`
+- `interval_level_f1`
+- `false_positive_rate`
+- `mean_detection_delay_cases`
+- `cause_taxonomy_hit_rate`
+- `evidence_fidelity`
+
+这些指标的含义分别是：
+
+- `interval_level_precision`
+  - 预测出的漂移区段中，有多少是真的
+- `interval_level_recall`
+  - 真实漂移区段中，有多少被系统抓到
+- `interval_level_f1`
+  - precision / recall 的折中
+- `false_positive_rate`
+  - 稳定区段被误判为 drift 的比例
+- `mean_detection_delay_cases`
+  - 从真实漂移开始到系统首次命中该区段的 case 级延迟
+- `cause_taxonomy_hit_rate`
+  - 注入类型是否被候选标签正确命中
+- `evidence_fidelity`
+  - 报告引用的 `evidence_ids` 是否真实存在
+
+---
+
+## 10. 当前状态
+
+目前系统已经能稳定完成：
+
+- 多漂移点检测
+- 漂移区段合并
+- 逐点证据提取
+- 候选根因标签生成
+- fallback 诊断
+- Markdown 总报告生成
+- 区段级 evaluation
+
+当前在合成结构漂移和 mixed 漂移场景下，区段级 precision / recall / F1 已经可以做到较好的结果。
+
+---
+
+## 11. 已知边界
+
+在使用和写论文时，请注意以下边界：
+
+- 候选根因是**证据支持的推断**，不是严格验证过的因果事实。
+- 如果日志里只有 `case/activity/timestamp` 三列，系统在 `case_mix_shift`、责任转移验证等方面会比较保守。
+- `legacy-half-split` 只是保留给对照实验，不是推荐主模式。
+- 纯时长型 drift 的检测链路仍然比结构型 drift 更敏感于窗口和阈值设置，需要继续优化。
+
+---
+
+## 12. 推荐运行方式
 
 ```powershell
-.venv\Scripts\python.exe run_full_pipeline.py
-.venv\Scripts\python.exe datasets\llm_analyst_official.py
+python run_full_pipeline.py --no-llm
+python run_full_pipeline.py --no-llm --inject-drift --drift-type mixed --drift-segments 2 --evaluate
+python datasets\llm_analyst_official.py --no-llm
 ```
 
-执行完成后查看：
-- `datasets/final_report_for_azure.json`
-- `examples/Final_Drift_Analysis_Report.md`
+运行后建议优先查看：
+
+- `outputs/drift_analysis.json`
+- `outputs/drift_score_timeline.csv`
+- `outputs/final_drift_report.md`
+- `outputs/human_review_rubric.md`
