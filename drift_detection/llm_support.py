@@ -2,6 +2,7 @@
 
 import json
 import os
+import warnings
 from typing import Any
 
 from openai import OpenAI
@@ -30,17 +31,17 @@ def enrich_with_llm_diagnosis(
         "model": settings.get("model"),
         "base_url": settings.get("base_url"),
         "used_llm": False,
-        "fallback_reason": None,
+        "fallback_reasons": [],
     }
 
     if not settings.get("enabled"):
-        diagnostics_meta["fallback_reason"] = "LLM disabled by configuration."
+        diagnostics_meta["fallback_reasons"].append("LLM disabled by configuration.")
         for point in drift_points:
             point["llm_diagnosis"] = fallback_diagnosis(point)
         return drift_points, diagnostics_meta
 
     if not settings.get("api_key"):
-        diagnostics_meta["fallback_reason"] = "OPENAI_API_KEY is not configured."
+        diagnostics_meta["fallback_reasons"].append("OPENAI_API_KEY is not configured.")
         for point in drift_points:
             point["llm_diagnosis"] = fallback_diagnosis(point)
         return drift_points, diagnostics_meta
@@ -55,7 +56,9 @@ def enrich_with_llm_diagnosis(
             point["llm_diagnosis"] = diagnose_drift_point(point, global_summary, client, settings["model"])
             diagnostics_meta["used_llm"] = True
         except Exception as exc:
-            diagnostics_meta["fallback_reason"] = str(exc)
+            msg = f"LLM diagnosis failed for {point['id']}: {exc}"
+            warnings.warn(msg)
+            diagnostics_meta["fallback_reasons"].append({"point_id": point["id"], "error": str(exc)})
             point["llm_diagnosis"] = fallback_diagnosis(point, error_message=str(exc))
     return drift_points, diagnostics_meta
 

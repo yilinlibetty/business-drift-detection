@@ -1,0 +1,35 @@
+# Confidence scores assigned to each rule-based tag.
+# Range: 0.0 (no confidence) – 1.0 (certain). Values are research-calibrated defaults.
+confidence:
+  path_added: 0.80
+  path_removed_with_shortening: 0.84
+  path_removed_without_shortening: 0.74
+  delay_increase: 0.82
+  loop_increase: 0.76
+  handoff_or_escalation_increase: 0.68
+  case_mix_shift_attribute: 0.72
+  case_mix_shift_fallback: 0.45
+
+# Minimum delta magnitudes required to trigger each tag.
+# All delta values are expressed as fractions (e.g. 0.05 = 5 percentage points).
+thresholds:
+  path_added_min_delta: 0.05         # minimum frequency increase to consider a trace "added"
+  path_added_strong_delta: 0.08      # if reference_count > 0, require this stronger delta
+  path_removed_min_delta: 0.03       # minimum frequency decrease to consider a trace "removed"
+  delay_median_min_minutes: 15.0     # median duration shift (minutes) to trigger delay_increase
+  delay_p90_min_minutes: 30.0        # p90 duration shift (minutes) to trigger delay_increase
+  loop_rate_min_delta: 0.05          # loop-rate change to trigger loop_increase
+  loop_repeated_activity_min_delta: 0.20  # avg repeated-activity delta to trigger loop_increase
+  duration_score_signal_min: 0.15    # minimum duration_score to trigger delay_increase via score signal alone
+  escalation_min_delta: 0.03         # minimum |delta| for an escalation-keyword item to count
+  attribute_shift_min_delta: 0.08    # attribute frequency shift to trigger case_mix_shift
+
+# Activity-name substrings (case-insensitive) that indicate escalation or handoff events.
+# Add Chinese keywords here as needed, e.g.: "升级", "转派", "移交"
+escalation_keywords:
+  - upgrade
+  - escalate
+  - escalation
+  - handoff
+  - assign
+  - transfer

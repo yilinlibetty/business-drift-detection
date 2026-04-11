@@ -1,21 +1,81 @@
 from __future__ import annotations
 
+import pathlib
 from collections import Counter
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import yaml
 
-from .pipeline import PipelineConfig, isoformat_or_none
+from .pipeline import ATTRIBUTE_SCORE_CANDIDATES, PipelineConfig, _extract_transitions, isoformat_or_none
 
-
-OPTIONAL_ATTRIBUTE_CANDIDATES = {
-    "resource": {"resource", "org:resource", "agent", "owner", "assignee"},
-    "team": {"team", "org:group", "group", "department"},
-    "priority": {"priority", "case:priority", "ticket_priority"},
-    "channel": {"channel", "source", "contact_channel"},
-    "region": {"region", "country", "market", "site"},
+_RULES_PATH = pathlib.Path(__file__).parent.parent / "config" / "tagging_rules.yaml"
+_REQUIRED_CONFIDENCE_KEYS = {
+    "path_added",
+    "path_removed_with_shortening",
+    "path_removed_without_shortening",
+    "delay_increase",
+    "loop_increase",
+    "handoff_or_escalation_increase",
+    "case_mix_shift_attribute",
+    "case_mix_shift_fallback",
 }
+_REQUIRED_THRESHOLD_KEYS = {
+    "path_added_min_delta",
+    "path_added_strong_delta",
+    "path_removed_min_delta",
+    "delay_median_min_minutes",
+    "delay_p90_min_minutes",
+    "duration_score_signal_min",
+    "loop_rate_min_delta",
+    "loop_repeated_activity_min_delta",
+    "escalation_min_delta",
+    "attribute_shift_min_delta",
+}
+
+
+def _load_tagging_rules(path: pathlib.Path = _RULES_PATH) -> dict[str, Any]:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = yaml.safe_load(handle)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Tagging rule config not found: {path}") from exc
+    _validate_tagging_rules(payload, str(path))
+    return payload
+
+
+def _validate_tagging_rules(payload: Any, source: str = "tagging rules") -> None:
+    if not isinstance(payload, dict):
+        raise ValueError(f"{source} must be a mapping.")
+
+    required_sections = {"confidence", "thresholds", "escalation_keywords"}
+    missing_sections = sorted(required_sections - set(payload))
+    if missing_sections:
+        raise ValueError(f"{source} missing required section(s): {', '.join(missing_sections)}")
+
+    if not isinstance(payload["confidence"], dict):
+        raise ValueError(f"{source} section 'confidence' must be a mapping.")
+    if not isinstance(payload["thresholds"], dict):
+        raise ValueError(f"{source} section 'thresholds' must be a mapping.")
+    if not isinstance(payload["escalation_keywords"], list):
+        raise ValueError(f"{source} section 'escalation_keywords' must be a list.")
+
+    missing_confidence = sorted(_REQUIRED_CONFIDENCE_KEYS - set(payload["confidence"]))
+    if missing_confidence:
+        raise ValueError(f"{source} missing confidence key(s): {', '.join(missing_confidence)}")
+
+    missing_thresholds = sorted(_REQUIRED_THRESHOLD_KEYS - set(payload["thresholds"]))
+    if missing_thresholds:
+        raise ValueError(f"{source} missing threshold key(s): {', '.join(missing_thresholds)}")
+
+
+_TAGGING_RULES: dict = _load_tagging_rules()
+_CONF = _TAGGING_RULES["confidence"]
+_THR = _TAGGING_RULES["thresholds"]
+_ESCALATION_KEYWORDS: set[str] = set(_TAGGING_RULES["escalation_keywords"])
+
+
 
 
 def build_evidence_pack(
@@ -50,6 +110,7 @@ def build_evidence_pack(
     rework_or_loop_rate_delta = _loop_delta(reference_cases, current_cases, register)
     duration_stats_delta = _duration_delta(reference_cases, current_cases, register)
     attribute_distribution_deltas = _attribute_deltas(reference_events, current_events, config.top_k, register)
+    score_contribution = _score_contribution(drift_point)
 
     return {
         "case_count": {"reference": len(reference_cases), "current": len(current_cases)},
@@ -70,6 +131,7 @@ def build_evidence_pack(
         "rework_or_loop_rate_delta": rework_or_loop_rate_delta,
         "duration_stats_delta": duration_stats_delta,
         "attribute_distribution_deltas": attribute_distribution_deltas,
+        "score_contribution": score_contribution,
         "evidence_ids": evidence_ids,
         "evidence_index": evidence_index,
     }
@@ -79,6 +141,19 @@ def _slice_case_window(cases: pd.DataFrame, window_meta: dict[str, Any]) -> pd.D
     start_idx = int(window_meta["start_case_index"])
     end_idx = int(window_meta["end_case_index"])
     return cases.iloc[start_idx:end_idx + 1].copy()
+
+
+def _score_contribution(drift_point: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "score_profile": drift_point.get("score_profile"),
+        "dominant_signal": drift_point.get("dominant_signal"),
+        "core_score": drift_point.get("core_score"),
+        "trace_score": drift_point.get("trace_score"),
+        "transition_score": drift_point.get("transition_score"),
+        "duration_score": drift_point.get("duration_score"),
+        "loop_score": drift_point.get("loop_score"),
+        "attribute_score": drift_point.get("attribute_score"),
+    }
 
 
 def _trace_deltas(
@@ -212,7 +287,7 @@ def _attribute_deltas(
 ) -> list[dict[str, Any]]:
     results = []
     normalized_columns = {column.lower(): column for column in set(reference_events.columns).union(current_events.columns)}
-    for logical_name, candidates in OPTIONAL_ATTRIBUTE_CANDIDATES.items():
+    for logical_name, candidates in ATTRIBUTE_SCORE_CANDIDATES.items():
         column_name = next((normalized_columns[candidate] for candidate in candidates if candidate in normalized_columns), None)
         if not column_name:
             continue
@@ -231,15 +306,6 @@ def _attribute_deltas(
                 )
             )
     return results
-
-
-def _extract_transitions(cases: pd.DataFrame) -> list[str]:
-    transitions = []
-    for activities in cases["Activities"]:
-        activities_list = list(activities)
-        for idx in range(len(activities_list) - 1):
-            transitions.append(f"{activities_list[idx]} -> {activities_list[idx + 1]}")
-    return transitions
 
 
 def _distribution_delta_rows(
@@ -286,16 +352,17 @@ def derive_rule_based_tags(drift_point: dict[str, Any], evidence: dict[str, Any]
 
     significant_added = [
         item for item in increased[:5]
-        if item["delta"] >= 0.05 and (item["reference_count"] == 0 or item["delta"] >= 0.08)
+        if item["delta"] >= _THR["path_added_min_delta"]
+        and (item["reference_count"] == 0 or item["delta"] >= _THR["path_added_strong_delta"])
     ]
     if significant_added:
         top = max(significant_added, key=lambda item: item["delta"])
-        tags.append(_build_tag("path_added", 0.8, [top["evidence_id"]], "Current window contains newly prominent paths."))
+        tags.append(_build_tag("path_added", _CONF["path_added"], [top["evidence_id"]], "Current window contains newly prominent paths."))
 
     decreased_lengths = [_trace_length(item.get("trace", "")) for item in decreased[:5] if item.get("trace")]
     shortened_paths = []
     for item in increased[:5]:
-        if item["delta"] < 0.03:
+        if item["delta"] < _THR["path_removed_min_delta"]:
             continue
         trace_length = _trace_length(item.get("trace", ""))
         if decreased_lengths and trace_length + 1 <= max(decreased_lengths):
@@ -303,7 +370,7 @@ def derive_rule_based_tags(drift_point: dict[str, Any], evidence: dict[str, Any]
         elif trace_length <= 3 and "Closed" in item.get("trace", ""):
             shortened_paths.append(item)
 
-    if any(item["delta"] <= -0.03 for item in decreased[:3]) or shortened_paths:
+    if any(item["delta"] <= -_THR["path_removed_min_delta"] for item in decreased[:3]) or shortened_paths:
         evidence_ids = []
         if decreased[:3]:
             evidence_ids.append(min(decreased[:3], key=lambda item: item["delta"])["evidence_id"])
@@ -312,7 +379,7 @@ def derive_rule_based_tags(drift_point: dict[str, Any], evidence: dict[str, Any]
         tags.append(
             _build_tag(
                 "path_removed_or_skipped_step",
-                0.84 if shortened_paths else 0.74,
+                _CONF["path_removed_with_shortening"] if shortened_paths else _CONF["path_removed_without_shortening"],
                 evidence_ids,
                 "Previously common paths weakened or current paths became shorter, consistent with skipped steps or path removal.",
             )
@@ -320,53 +387,52 @@ def derive_rule_based_tags(drift_point: dict[str, Any], evidence: dict[str, Any]
 
     duration_delta_stats = duration_delta.get("delta", {})
     if duration_delta_stats and (
-        duration_delta_stats.get("median", 0.0) >= 15.0
-        or duration_delta_stats.get("p90", 0.0) >= 30.0
-        or drift_point.get("duration_score", 0.0) >= max(0.15, drift_point.get("trace_score", 0.0))
+        duration_delta_stats.get("median", 0.0) >= _THR["delay_median_min_minutes"]
+        or duration_delta_stats.get("p90", 0.0) >= _THR["delay_p90_min_minutes"]
+        or drift_point.get("duration_score", 0.0) >= max(_THR["duration_score_signal_min"], drift_point.get("trace_score", 0.0))
     ):
         tags.append(
             _build_tag(
                 "delay_increase",
-                0.82,
+                _CONF["delay_increase"],
                 [duration_delta.get("evidence_id")],
                 "Case duration shifted upward, especially in median or high-percentile latency.",
             )
         )
 
     if loop_delta and (
-        loop_delta.get("loop_rate_delta", 0.0) >= 0.05
-        or loop_delta.get("avg_repeated_activities_delta", 0.0) >= 0.2
+        loop_delta.get("loop_rate_delta", 0.0) >= _THR["loop_rate_min_delta"]
+        or loop_delta.get("avg_repeated_activities_delta", 0.0) >= _THR["loop_repeated_activity_min_delta"]
     ):
         tags.append(
             _build_tag(
                 "loop_increase",
-                0.76,
+                _CONF["loop_increase"],
                 [loop_delta.get("evidence_id")],
                 "Repeated activities became more common in the current window.",
             )
         )
 
-    escalation_keywords = {"upgrade", "escalate", "escalation", "handoff", "assign", "transfer"}
     escalation_evidence_ids = []
     for item in increased[:5] + transitions[:5] + activities[:5]:
         label = " ".join(str(value).lower() for key, value in item.items() if key in {"trace", "transition", "activity"})
-        if any(keyword in label for keyword in escalation_keywords) and abs(item.get("delta", 0.0)) >= 0.03:
+        if any(keyword in label for keyword in _ESCALATION_KEYWORDS) and abs(item.get("delta", 0.0)) >= _THR["escalation_min_delta"]:
             escalation_evidence_ids.append(item["evidence_id"])
     if escalation_evidence_ids:
         tags.append(
             _build_tag(
                 "handoff_or_escalation_increase",
-                0.68,
+                _CONF["handoff_or_escalation_increase"],
                 escalation_evidence_ids[:3],
                 "Escalation or handoff-like transitions increased in the current window.",
             )
         )
 
-    if any(abs(item.get("delta", 0.0)) >= 0.08 for item in attribute_deltas[:5]):
+    if any(abs(item.get("delta", 0.0)) >= _THR["attribute_shift_min_delta"] for item in attribute_deltas[:5]):
         tags.append(
             _build_tag(
                 "case_mix_shift",
-                0.72,
+                _CONF["case_mix_shift_attribute"],
                 [item["evidence_id"] for item in attribute_deltas[:3]],
                 "Optional business attributes shifted, indicating case mix changes.",
             )
@@ -380,7 +446,7 @@ def derive_rule_based_tags(drift_point: dict[str, Any], evidence: dict[str, Any]
         tags.append(
             _build_tag(
                 "case_mix_shift",
-                0.45,
+                _CONF["case_mix_shift_fallback"],
                 fallback_evidence,
                 "Multiple behavior changes are present but do not map cleanly to a single stronger taxonomy.",
             )

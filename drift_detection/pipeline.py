@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import os
@@ -11,6 +12,19 @@ import pandas as pd
 from scipy.stats import wasserstein_distance
 
 from convert_data import load_event_log
+
+
+ATTRIBUTE_SCORE_CANDIDATES = {
+    "resource": {"resource", "org:resource", "agent", "owner", "assignee"},
+    "team": {"team", "org:group", "group", "department", "workgroup", "support_section"},
+    "priority": {"priority", "case:priority", "ticket_priority", "seriousness", "seriousness_2"},
+    "channel": {"channel", "source", "contact_channel"},
+    "region": {"region", "country", "market", "site"},
+    "product": {"product", "case:loangoal", "loangoal"},
+    "service_type": {"service_type", "case:applicationtype", "applicationtype"},
+    "service_level": {"service_level"},
+    "customer": {"customer"},
+}
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -28,6 +42,7 @@ class PipelineConfig:
     col_timestamp: str
     keep_only_complete: bool = True
     drift_metric: str = "tv"
+    score_profile: str = "trace-duration"
     detection_mode: str = "mixed"
     top_k: int = 10
     threshold: float = 0.05
@@ -44,6 +59,7 @@ class PipelineConfig:
     drift_segments: int = 1
     drift_segment_ratio: float = 0.12
     legacy_half_split: bool = False
+    mad_multiplier: float = 3.0  # k in: auto_threshold = median(scores) + k * MAD(scores)
 
     @classmethod
     def from_env(cls) -> "PipelineConfig":
@@ -55,6 +71,7 @@ class PipelineConfig:
             col_timestamp=os.getenv("COL_TIMESTAMP", "Complete Timestamp"),
             keep_only_complete=_bool_env("KEEP_ONLY_COMPLETE", True),
             drift_metric=os.getenv("DRIFT_METRIC", "tv").lower(),
+            score_profile=os.getenv("SCORE_PROFILE", "trace-duration").lower(),
             detection_mode=os.getenv("DETECTION_MODE", os.getenv("DRIFT_TYPE", "mixed")).lower(),
             top_k=int(os.getenv("TOP_K_TRACES", "10")),
             threshold=float(os.getenv("DRIFT_THRESHOLD", "0.05")),
@@ -71,6 +88,7 @@ class PipelineConfig:
             drift_segments=int(os.getenv("DRIFT_SEGMENTS", "1")),
             drift_segment_ratio=float(os.getenv("DRIFT_SEGMENT_RATIO", "0.12")),
             legacy_half_split=_bool_env("LEGACY_HALF_SPLIT", False),
+            mad_multiplier=float(os.getenv("MAD_MULTIPLIER", "3.0")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -163,18 +181,26 @@ def load_preprocessed_event_log(config: PipelineConfig) -> pd.DataFrame:
 
 
 def build_case_table(df_events: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
-    grouped = (
-        df_events.sort_values([config.col_case_id, config.col_timestamp])
-        .groupby(config.col_case_id, sort=False)
-        .agg(
-            Activities=(config.col_activity, lambda x: tuple(map(str, x))),
-            StartTime=(config.col_timestamp, "min"),
-            EndTime=(config.col_timestamp, "max"),
-            EventCount=(config.col_activity, "size"),
-        )
-        .reset_index()
+    sorted_events = df_events.sort_values([config.col_case_id, config.col_timestamp])
+    agg_spec: dict = dict(
+        Activities=(config.col_activity, lambda x: tuple(map(str, x))),
+        StartTime=(config.col_timestamp, "min"),
+        EndTime=(config.col_timestamp, "max"),
+        EventCount=(config.col_activity, "size"),
     )
-    grouped = grouped.rename(columns={config.col_case_id: "CaseID"})
+    attribute_columns = _resolve_attribute_columns(df_events.columns)
+    if attribute_columns:
+        agg_spec.update({
+            f"Attr_{logical_name}": (column_name, _first_non_empty_value)
+            for logical_name, column_name in attribute_columns.items()
+        })
+    grouped = (
+        sorted_events
+        .groupby(config.col_case_id, sort=False)
+        .agg(**agg_spec)
+        .reset_index()
+        .rename(columns={config.col_case_id: "CaseID"})
+    )
     grouped["Trace"] = grouped["Activities"].apply(lambda items: " -> ".join(items))
     grouped["Duration"] = (grouped["EndTime"] - grouped["StartTime"]).dt.total_seconds() / 60.0
     grouped["RepeatedActivityCount"] = grouped["Activities"].apply(_count_repeated_activities)
@@ -182,6 +208,26 @@ def build_case_table(df_events: pd.DataFrame, config: PipelineConfig) -> pd.Data
     grouped = grouped.sort_values("EndTime").reset_index(drop=True)
     grouped["CaseIndex"] = grouped.index
     return grouped
+
+
+def _resolve_attribute_columns(columns: pd.Index) -> dict[str, str]:
+    normalized_columns = {str(column).lower(): str(column) for column in columns}
+    resolved: dict[str, str] = {}
+    for logical_name, candidates in ATTRIBUTE_SCORE_CANDIDATES.items():
+        column_name = next((normalized_columns[candidate] for candidate in candidates if candidate in normalized_columns), None)
+        if column_name:
+            resolved[logical_name] = column_name
+    return resolved
+
+
+def _first_non_empty_value(values: pd.Series) -> str | None:
+    for value in values:
+        if pd.isna(value):
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
 
 
 def _count_repeated_activities(activities: tuple[str, ...]) -> int:
@@ -348,14 +394,13 @@ def build_score_timeline(cases: pd.DataFrame, config: PipelineConfig) -> list[di
         window_size = max(5, total_cases // 2)
         step_size = max(1, min(step_size, max(1, window_size // 2)))
 
+    attr_cols = [c for c in cases.columns if str(c).startswith("Attr_")]
     score_rows: list[dict[str, Any]] = []
     window_id = 1
     for start in range(0, total_cases - 2 * window_size + 1, step_size):
         reference = cases.iloc[start:start + window_size]
         current = cases.iloc[start + window_size:start + 2 * window_size]
-        trace_score = _compute_trace_score(reference, current, config.drift_metric)
-        duration_score, duration_score_raw = compute_duration_drift(reference, current)
-        final_score_raw = combine_drift_scores(trace_score, duration_score, config.detection_mode)
+        scores = _compute_window_scores(reference, current, config, attr_cols)
         score_rows.append(
             {
                 "window_id": f"W{window_id:04d}",
@@ -368,10 +413,7 @@ def build_score_timeline(cases: pd.DataFrame, config: PipelineConfig) -> list[di
                 "reference_end_time": isoformat_or_none(reference.iloc[-1]["EndTime"]),
                 "current_start_time": isoformat_or_none(current.iloc[0]["StartTime"]),
                 "current_end_time": isoformat_or_none(current.iloc[-1]["EndTime"]),
-                "trace_score": float(trace_score),
-                "duration_score": float(duration_score),
-                "duration_score_raw": float(duration_score_raw),
-                "final_score_raw": float(final_score_raw),
+                **scores,
             }
         )
         window_id += 1
@@ -380,6 +422,80 @@ def build_score_timeline(cases: pd.DataFrame, config: PipelineConfig) -> list[di
     for row, score in zip(score_rows, smoothed_scores):
         row["final_score"] = float(score)
     return score_rows
+
+
+def _compute_window_scores(
+    reference: pd.DataFrame,
+    current: pd.DataFrame,
+    config: PipelineConfig,
+    attr_cols: list[str] | None = None,
+) -> dict[str, Any]:
+    trace_score = _compute_trace_score(reference, current, config.drift_metric)
+    duration_score, duration_score_raw = compute_duration_drift(reference, current)
+
+    if config.score_profile == "multi-view":
+        core_score = combine_drift_scores(trace_score, duration_score, config.detection_mode)
+        raw_transition_score = _compute_transition_score(reference, current, config.drift_metric)
+        raw_loop_score = _compute_loop_score(reference, current)
+        raw_attribute_score = _compute_attribute_score(reference, current, config.drift_metric, attr_cols)
+        if config.detection_mode == "delay":
+            transition_anchor = duration_score
+            loop_anchor = duration_score
+        elif config.detection_mode == "structure":
+            transition_anchor = trace_score
+            loop_anchor = trace_score
+        else:
+            transition_anchor = max(trace_score, duration_score, core_score)
+            loop_anchor = max(trace_score, duration_score, core_score)
+        transition_score = raw_transition_score * transition_anchor
+        loop_score = raw_loop_score * loop_anchor
+        process_anchor = max(trace_score, duration_score, transition_score, loop_score, core_score)
+        attribute_score = raw_attribute_score * process_anchor
+        if config.detection_mode == "delay":
+            candidate_scores = {"core": core_score, "duration": duration_score, "loop": loop_score}
+        elif config.detection_mode == "structure":
+            candidate_scores = {
+                "core": core_score,
+                "trace": trace_score,
+                "transition": transition_score,
+                "attribute": attribute_score,
+            }
+        else:
+            candidate_scores = {
+                "core": core_score,
+                "trace": trace_score,
+                "transition": transition_score,
+                "duration": duration_score,
+                "loop": loop_score,
+                "attribute": attribute_score,
+            }
+        dominant_signal, final_score_raw = max(candidate_scores.items(), key=lambda item: (item[1], item[0]))
+        return {
+            "score_profile": config.score_profile,
+            "core_score": float(core_score),
+            "trace_score": float(trace_score),
+            "transition_score": float(transition_score),
+            "duration_score": float(duration_score),
+            "duration_score_raw": float(duration_score_raw),
+            "loop_score": float(loop_score),
+            "attribute_score": float(attribute_score),
+            "dominant_signal": dominant_signal,
+            "final_score_raw": float(final_score_raw),
+        }
+
+    final_score_raw = combine_drift_scores(trace_score, duration_score, config.detection_mode)
+    return {
+        "score_profile": config.score_profile,
+        "core_score": float(final_score_raw),
+        "trace_score": float(trace_score),
+        "transition_score": None,
+        "duration_score": float(duration_score),
+        "duration_score_raw": float(duration_score_raw),
+        "loop_score": None,
+        "attribute_score": None,
+        "dominant_signal": None,
+        "final_score_raw": float(final_score_raw),
+    }
 
 
 def _compute_trace_score(reference: pd.DataFrame, current: pd.DataFrame, metric: str) -> float:
@@ -396,6 +512,64 @@ def _compute_trace_score(reference: pd.DataFrame, current: pd.DataFrame, metric:
         return vector
 
     return compute_distribution_distance(get_vector(reference), get_vector(current), metric=metric)
+
+
+def _compute_transition_score(reference: pd.DataFrame, current: pd.DataFrame, metric: str) -> float:
+    reference_counter = Counter(_extract_transitions(reference))
+    current_counter = Counter(_extract_transitions(current))
+    return _compute_counter_distance(reference_counter, current_counter, metric)
+
+
+def _compute_counter_distance(reference_counter: Counter, current_counter: Counter, metric: str) -> float:
+    all_keys = sorted(set(reference_counter) | set(current_counter))
+    if not all_keys:
+        return 0.0
+    total_reference = float(sum(reference_counter.values())) or 1.0
+    total_current = float(sum(current_counter.values())) or 1.0
+    reference_vector = np.asarray([reference_counter.get(key, 0.0) / total_reference for key in all_keys], dtype=float)
+    current_vector = np.asarray([current_counter.get(key, 0.0) / total_current for key in all_keys], dtype=float)
+    return compute_distribution_distance(reference_vector, current_vector, metric=metric)
+
+
+def _extract_transitions(cases: pd.DataFrame) -> list[str]:
+    # Activities is already a tuple — no list() conversion needed.
+    # extend+generator is faster than nested append.
+    transitions: list[str] = []
+    for activities in cases["Activities"]:
+        transitions.extend(f"{activities[i]} -> {activities[i + 1]}" for i in range(len(activities) - 1))
+    return transitions
+
+
+def _compute_loop_score(reference: pd.DataFrame, current: pd.DataFrame) -> float:
+    reference_loop_rate = float(reference["HasLoop"].mean()) if len(reference) else 0.0
+    current_loop_rate = float(current["HasLoop"].mean()) if len(current) else 0.0
+    loop_rate_delta = abs(current_loop_rate - reference_loop_rate)
+
+    reference_repeated = float(reference["RepeatedActivityCount"].mean()) if len(reference) else 0.0
+    current_repeated = float(current["RepeatedActivityCount"].mean()) if len(current) else 0.0
+    repeated_scale = max(1.0, reference_repeated, current_repeated)
+    repeated_delta = abs(current_repeated - reference_repeated) / repeated_scale
+    # Take max rather than average: HasLoop (binary) and RepeatedActivityCount (continuous) measure
+    # the same rework phenomenon at different resolutions — the stronger signal wins.
+    return float(min(1.0, max(loop_rate_delta, repeated_delta)))
+
+
+def _compute_attribute_score(
+    reference: pd.DataFrame,
+    current: pd.DataFrame,
+    metric: str,
+    attribute_columns: list[str] | None = None,
+) -> float:
+    if attribute_columns is None:
+        attribute_columns = [c for c in reference.columns if str(c).startswith("Attr_")]
+    if not attribute_columns:
+        return 0.0
+    scores = []
+    for column in attribute_columns:
+        reference_counter = Counter(reference[column].dropna().astype(str))
+        current_counter = Counter(current[column].dropna().astype(str))
+        scores.append(_compute_counter_distance(reference_counter, current_counter, metric))
+    return float(max(scores, default=0.0))
 
 
 def _median_smooth(values: list[float]) -> list[float]:
@@ -417,9 +591,8 @@ def build_legacy_timeline(cases: pd.DataFrame, config: PipelineConfig) -> list[d
     current = cases.iloc[mid:]
     if reference.empty or current.empty:
         return []
-    trace_score = _compute_trace_score(reference, current, config.drift_metric)
-    duration_score, duration_score_raw = compute_duration_drift(reference, current)
-    final_score = combine_drift_scores(trace_score, duration_score, config.detection_mode)
+    attr_cols = [c for c in cases.columns if str(c).startswith("Attr_")]
+    scores = _compute_window_scores(reference, current, config, attr_cols)
     return [
         {
             "window_id": "W0001",
@@ -432,11 +605,8 @@ def build_legacy_timeline(cases: pd.DataFrame, config: PipelineConfig) -> list[d
             "reference_end_time": isoformat_or_none(reference.iloc[-1]["EndTime"]),
             "current_start_time": isoformat_or_none(current.iloc[0]["StartTime"]),
             "current_end_time": isoformat_or_none(current.iloc[-1]["EndTime"]),
-            "trace_score": float(trace_score),
-            "duration_score": float(duration_score),
-            "duration_score_raw": float(duration_score_raw),
-            "final_score_raw": float(final_score),
-            "final_score": float(final_score),
+            **scores,
+            "final_score": float(scores["final_score_raw"]),
         }
     ]
 
@@ -445,6 +615,7 @@ def resolve_threshold(
     timeline: list[dict[str, Any]],
     base_threshold: float,
     auto_threshold: bool,
+    mad_multiplier: float = 3.0,
 ) -> tuple[float, dict[str, Any]]:
     if not timeline:
         return base_threshold, {"source": "configured", "configured_threshold": base_threshold}
@@ -455,13 +626,14 @@ def resolve_threshold(
 
     median_score = float(np.median(scores))
     mad = float(np.median(np.abs(scores - median_score)))
-    auto_candidate = median_score + 3.0 * mad
+    auto_candidate = median_score + mad_multiplier * mad
     threshold = max(base_threshold, auto_candidate)
     return threshold, {
         "source": "auto",
         "configured_threshold": base_threshold,
         "median_score": median_score,
         "mad_score": mad,
+        "mad_multiplier": mad_multiplier,
         "auto_candidate": auto_candidate,
     }
 
@@ -511,9 +683,15 @@ def detect_drift_points(
                 "interval_end_case_index": last_window["current_end_index"],
                 "peak_time": peak_window["current_end_time"],
                 "peak_score": round(float(peak_window["final_score"]), 4),
+                "core_score": _round_optional_score(peak_window.get("core_score")),
                 "trace_score": round(float(peak_window["trace_score"]), 4),
+                "transition_score": _round_optional_score(peak_window.get("transition_score")),
                 "duration_score": round(float(peak_window["duration_score"]), 4),
                 "duration_score_raw": round(float(peak_window["duration_score_raw"]), 4),
+                "loop_score": _round_optional_score(peak_window.get("loop_score")),
+                "attribute_score": _round_optional_score(peak_window.get("attribute_score")),
+                "score_profile": peak_window.get("score_profile"),
+                "dominant_signal": peak_window.get("dominant_signal"),
                 "threshold_excess": round(float(peak_window["final_score"] - threshold), 4),
                 "reference_window": {
                     "start_case_index": peak_window["reference_start_index"],
@@ -538,6 +716,12 @@ def detect_drift_points(
             }
         )
     return drift_points
+
+
+def _round_optional_score(value: Any) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    return round(float(value), 4)
 
 
 def _resolve_interval_merge_gap_cases(timeline: list[dict[str, Any]]) -> int:
@@ -580,6 +764,7 @@ def build_global_summary(
         "std_score": round(float(np.std(scores)) if scores else 0.0, 4),
         "detection_mode": config.detection_mode,
         "drift_metric": config.drift_metric,
+        "score_profile": config.score_profile,
     }
 
 
@@ -716,7 +901,12 @@ def build_legacy_summary(
         "trace_drift_score": strongest["trace_score"] if strongest else 0.0,
         "duration_drift_score": strongest["duration_score"] if strongest else 0.0,
         "duration_drift_score_raw": strongest["duration_score_raw"] if strongest else 0.0,
+        "transition_drift_score": strongest.get("transition_score") if strongest else None,
+        "loop_drift_score": strongest.get("loop_score") if strongest else None,
+        "attribute_drift_score": strongest.get("attribute_score") if strongest else None,
+        "dominant_signal": strongest.get("dominant_signal") if strongest else None,
         "drift_metric": config.drift_metric,
+        "score_profile": config.score_profile,
         "detection_mode": config.detection_mode,
         "detection_threshold": global_summary["threshold"],
         "analysis": {

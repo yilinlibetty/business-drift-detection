@@ -22,12 +22,14 @@ def render_markdown_report(result: dict[str, Any]) -> str:
     lines.append(f"- 最高平滑分数：`{global_summary.get('peak_score', 0.0)}`")
     lines.append(f"- 判定阈值：`{global_summary.get('threshold', 0.0)}`")
     lines.append(f"- LLM 诊断：`{'enabled' if llm_meta.get('enabled') else 'disabled'}`，实际调用：`{llm_meta.get('used_llm', False)}`")
-    if llm_meta.get("fallback_reason"):
-        lines.append(f"- LLM fallback：{llm_meta['fallback_reason']}")
+    fallback_reasons = _format_fallback_reasons(llm_meta)
+    if fallback_reasons:
+        lines.append(f"- LLM fallback：{'; '.join(fallback_reasons)}")
     lines.append("")
     lines.append("## 检测方法与阈值")
     lines.append("")
     lines.append(f"- 分析模式：`{config.get('analysis_mode', 'timeline')}`")
+    lines.append(f"- 评分配置：`{config.get('score_profile', global_summary.get('score_profile', 'trace-duration'))}`")
     lines.append(f"- 漂移度量：`trace={config.get('drift_metric', 'tv')}`，`mode={config.get('detection_mode', 'mixed')}`")
     lines.append(f"- 窗口参数：`window_size={config.get('window_size')}`，`step_size={config.get('step_size')}`")
     threshold_details = global_summary.get("threshold_details", {})
@@ -35,9 +37,10 @@ def render_markdown_report(result: dict[str, Any]) -> str:
         lines.append(f"- 阈值来源：`{threshold_details.get('source', 'configured')}`")
         if threshold_details.get("source") == "auto":
             lines.append(
-                "- 自动阈值细节：median=`{}`，MAD=`{}`，auto_candidate=`{}`，最终阈值=`{}`".format(
+                "- 自动阈值细节：median=`{}`，MAD=`{}`，MAD multiplier=`{}`，auto_candidate=`{}`，最终阈值=`{}`".format(
                     threshold_details.get("median_score"),
                     threshold_details.get("mad_score"),
+                    threshold_details.get("mad_multiplier", 3.0),
                     threshold_details.get("auto_candidate"),
                     global_summary.get("threshold"),
                 )
@@ -84,6 +87,20 @@ def render_markdown_report(result: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _format_fallback_reasons(llm_meta: dict[str, Any]) -> list[str]:
+    reasons = []
+    if llm_meta.get("fallback_reason"):
+        reasons.append(str(llm_meta["fallback_reason"]))
+    for reason in llm_meta.get("fallback_reasons", []) or []:
+        if isinstance(reason, dict):
+            point_id = reason.get("point_id")
+            error = reason.get("error")
+            reasons.append(f"{point_id}: {error}" if point_id else str(error or reason))
+        else:
+            reasons.append(str(reason))
+    return reasons
+
+
 def render_human_review_rubric(result: dict[str, Any]) -> str:
     drift_points = result.get("drift_points", [])
     lines = [
@@ -120,6 +137,18 @@ def _render_drift_point(point: dict[str, Any]) -> list[str]:
             point.get("duration_score"),
         )
     )
+    score_contribution = evidence.get("score_contribution", {})
+    if score_contribution:
+        lines.append(
+            "- 多视角分数贡献：profile=`{}`，dominant=`{}`，core=`{}`，transition=`{}`，loop=`{}`，attribute=`{}`".format(
+                score_contribution.get("score_profile"),
+                score_contribution.get("dominant_signal"),
+                score_contribution.get("core_score"),
+                score_contribution.get("transition_score"),
+                score_contribution.get("loop_score"),
+                score_contribution.get("attribute_score"),
+            )
+        )
     delay = point.get("detection_delay_proxy", {})
     lines.append(
         "- Detection delay proxy：`cases_to_peak={}`，`hours_to_peak={}`".format(

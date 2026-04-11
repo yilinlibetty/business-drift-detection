@@ -475,3 +475,120 @@ python datasets\llm_analyst_official.py --no-llm
 - `outputs/drift_score_timeline.csv`
 - `outputs/final_drift_report.md`
 - `outputs/human_review_rubric.md`
+
+---
+
+## 13. 论文冲刺版更新：multi-view scoring 与可复现实验
+
+当前推荐的论文创新表述是：
+
+> A configurable evidence-driven process drift diagnosis pipeline with multi-view scoring and reproducible ablation experiments.
+
+也就是说，本项目不把候选根因表述为已经验证过的事实根因，而是输出**由 evidence ids 支撑的候选诊断假设**，并保留人工复核入口。
+
+### 13.1 新增评分配置
+
+主流程新增 `--score-profile`：
+
+```powershell
+python run_full_pipeline.py --no-llm --score-profile trace-duration
+python run_full_pipeline.py --no-llm --score-profile multi-view
+```
+
+- `trace-duration`：兼容旧版行为，只使用 trace 分布漂移和 duration 漂移。
+- `multi-view`：在 trace/duration 之外，额外计算 transition、loop/rework、attribute/case-mix 视角分数，并输出 `dominant_signal`。辅助视角会用 process signal 做锚定，并尊重 `detection_mode`，避免普通属性或结构波动在 delay-only 场景中单独触发漂移。
+
+`outputs/drift_score_timeline.csv` 在 `multi-view` 下会包含：
+
+- `transition_score`
+- `loop_score`
+- `attribute_score`
+- `core_score`
+- `dominant_signal`
+
+每个 drift point 的 evidence pack 也会包含 `score_contribution`，用于解释触发漂移判断的主要视角。
+
+### 13.2 自动阈值参数化
+
+自动阈值公式为：
+
+```text
+threshold = max(configured_threshold, median(scores) + mad_multiplier * MAD(scores))
+```
+
+可通过 CLI 或环境变量配置：
+
+```powershell
+python run_full_pipeline.py --no-llm --mad-multiplier 2.5
+$env:MAD_MULTIPLIER="2.5"
+```
+
+报告中的“检测方法与阈值”部分会显示 `mad_multiplier`。
+
+### 13.3 规则配置外置
+
+规则标签的阈值、confidence 和 escalation keywords 已外置到：
+
+```text
+config/tagging_rules.yaml
+```
+
+启动时会校验必要字段。如果缺少必须字段，系统会在导入 evidence 模块时给出清晰错误，而不是在运行中抛出不明确的 `KeyError`。
+
+### 13.4 批量实验与 ablation
+
+新增批量实验入口：
+
+```powershell
+python run_experiments.py
+```
+
+默认会比较：
+
+- `trace-duration`
+- `multi-view`
+
+默认场景包括：
+
+- `structure_1_segment`
+- `delay_1_segment`
+- `mixed_1_segment`
+- `mixed_2_segments`
+
+输出位置：
+
+```text
+outputs/experiments/experiment_summary.csv
+outputs/experiments/experiment_summary.md
+```
+
+核心字段包括：
+
+- `scenario`
+- `seed`
+- `score_profile`
+- `precision`
+- `recall`
+- `f1`
+- `false_positive_rate`
+- `mean_detection_delay_cases`
+- `taxonomy_hit_rate`
+- `predicted_interval_count`
+
+### 13.5 测试
+
+新增 pytest 测试覆盖：
+
+- 自动阈值和 `mad_multiplier`
+- drift point 合并逻辑
+- rule-based tagging
+- YAML tagging rules 校验
+- LLM fallback metadata
+- Markdown report fallback 渲染
+- multi-view score 非负性和 `dominant_signal`
+
+运行方式：
+
+```powershell
+pytest -q
+```

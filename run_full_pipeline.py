@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import sys
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -41,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     threshold_group.add_argument("--fixed-threshold", dest="auto_threshold", action="store_false")
     parser.add_argument("--top-k", type=int, default=defaults.top_k)
     parser.add_argument("--drift-metric", choices=["tv", "l1"], default=defaults.drift_metric)
+    parser.add_argument(
+        "--score-profile",
+        choices=["trace-duration", "multi-view"],
+        default=defaults.score_profile,
+        help="Scoring profile: legacy trace/duration scoring or multi-view evidence scoring",
+    )
     parser.add_argument("--detection-mode", choices=["structure", "delay", "mixed", "auto"], default=None)
     llm_group = parser.add_mutually_exclusive_group()
     llm_group.add_argument("--llm-enabled", dest="llm_enabled", action="store_true", default=defaults.llm_enabled)
@@ -54,6 +61,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--drift-segment-ratio", type=float, default=defaults.drift_segment_ratio)
     parser.add_argument("--target-activity", default=defaults.target_activity)
     parser.add_argument("--drift-seed", type=int, default=defaults.drift_seed)
+    parser.add_argument(
+        "--mad-multiplier",
+        type=float,
+        default=defaults.mad_multiplier,
+        help="k in auto-threshold formula: threshold = median(scores) + k * MAD(scores) (default: 3.0)",
+    )
     return parser.parse_args()
 
 
@@ -66,6 +79,7 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
     config.auto_threshold = args.auto_threshold
     config.top_k = args.top_k
     config.drift_metric = args.drift_metric
+    config.score_profile = args.score_profile
     config.llm_enabled = args.llm_enabled
     config.output_dir = args.output_dir
     config.inject_drift = args.inject_drift
@@ -83,6 +97,7 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
     config.drift_segment_ratio = args.drift_segment_ratio
     config.target_activity = args.target_activity
     config.drift_seed = args.drift_seed
+    config.mad_multiplier = args.mad_multiplier
     return config
 
 
@@ -91,28 +106,30 @@ def write_json(path: str, payload: dict) -> None:
         json.dump(serialize_value(payload), handle, indent=2, ensure_ascii=False)
 
 
-def main() -> None:
-    args = parse_args()
-    config = build_config(args)
-    os.makedirs(config.output_dir, exist_ok=True)
+def run_pipeline(config: PipelineConfig, evaluate_requested: bool = False, verbose: bool = True) -> dict:
+    def log(message: str) -> None:
+        if verbose:
+            print(message)
 
-    print(f"[1/6] Loading event log from {config.file_path}")
+    requested_window_size = config.window_size
+
+    log(f"[1/6] Loading event log from {config.file_path}")
     df_events = load_preprocessed_event_log(config)
     base_cases = build_case_table(df_events, config)
-    print(f"      -> loaded {len(df_events)} events across {len(base_cases)} cases")
+    log(f"      -> loaded {len(df_events)} events across {len(base_cases)} cases")
 
     ground_truth_annotations = []
     df_analysis = df_events
     if config.inject_drift:
-        print(f"[2/6] Injecting synthetic drift: type={config.drift_type}, segments={config.drift_segments}")
+        log(f"[2/6] Injecting synthetic drift: type={config.drift_type}, segments={config.drift_segments}")
         df_analysis, ground_truth_annotations = inject_synthetic_drift(df_events, base_cases, config)
     else:
-        print("[2/6] No synthetic drift injection requested")
+        log("[2/6] No synthetic drift injection requested")
 
     cases = build_case_table(df_analysis, config)
     truth_intervals = finalize_truth_intervals(ground_truth_annotations, cases)
 
-    print(f"[3/6] Building score timeline in {config.analysis_mode} mode")
+    log(f"[3/6] Building score timeline in {config.analysis_mode} mode using {config.score_profile} scoring")
     if config.analysis_mode == "legacy-half-split":
         timeline = build_legacy_timeline(cases, config)
     else:
@@ -120,17 +137,25 @@ def main() -> None:
 
     if timeline:
         resolved_window_size = timeline[0]["reference_end_index"] - timeline[0]["reference_start_index"] + 1
+        if requested_window_size is not None and requested_window_size != resolved_window_size:
+            print(
+                f"[info] window_size adjusted: {requested_window_size} -> {resolved_window_size} "
+                f"(snapped to even division of {len(cases)} cases)",
+                file=sys.stderr,
+            )
         config.window_size = resolved_window_size
         if len(timeline) > 1:
             config.step_size = timeline[1]["reference_start_index"] - timeline[0]["reference_start_index"]
         elif config.step_size is None:
             config.step_size = resolved_window_size
 
-    threshold, threshold_details = resolve_threshold(timeline, config.threshold, config.auto_threshold)
+    threshold, threshold_details = resolve_threshold(
+        timeline, config.threshold, config.auto_threshold, config.mad_multiplier
+    )
     drift_points = detect_drift_points(timeline, threshold)
-    print(f"      -> detected {len(drift_points)} drift point(s) with threshold {threshold:.4f}")
+    log(f"      -> detected {len(drift_points)} drift point(s) with threshold {threshold:.4f}")
 
-    print("[4/6] Extracting evidence and rule-based tags")
+    log("[4/6] Extracting evidence and rule-based tags")
     for point in drift_points:
         point["evidence"] = build_evidence_pack(point, cases, df_analysis, config)
         point["rule_based_tags"] = derive_rule_based_tags(point, point["evidence"])
@@ -143,17 +168,17 @@ def main() -> None:
                 tag for tag in point["rule_based_tags"] if tag["tag"] != "delay_increase"
             ]
 
-    print("[5/6] Running LLM/fallback diagnosis")
+    log("[5/6] Running LLM/fallback diagnosis")
     global_summary = build_global_summary(timeline, drift_points, threshold, threshold_details, config)
     llm_settings = load_llm_settings(config.llm_enabled)
     drift_points, llm_meta = enrich_with_llm_diagnosis(drift_points, global_summary, llm_settings)
 
     evaluation = None
-    if args.evaluate or truth_intervals:
+    if evaluate_requested or truth_intervals:
         evaluation = evaluate_detection(timeline, drift_points, truth_intervals, threshold)
         evaluation = augment_evaluation_with_evidence_fidelity(evaluation, drift_points)
 
-    result = {
+    return {
         "run_metadata": {
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "source_log": config.file_path,
@@ -169,7 +194,13 @@ def main() -> None:
         "llm": llm_meta,
     }
 
-    print("[6/6] Writing outputs")
+
+def write_outputs(result: dict, config: PipelineConfig) -> None:
+    os.makedirs(config.output_dir, exist_ok=True)
+    timeline = result.get("score_timeline", [])
+    global_summary = result.get("global_summary", {})
+    drift_points = result.get("drift_points", [])
+    threshold = global_summary.get("threshold", config.threshold)
     analysis_json_path = os.path.join(config.output_dir, "drift_analysis.json")
     timeline_csv_path = os.path.join(config.output_dir, "drift_score_timeline.csv")
     report_md_path = os.path.join(config.output_dir, "final_drift_report.md")
@@ -195,6 +226,14 @@ def main() -> None:
     print(f"      -> {rubric_md_path}")
     print(f"      -> {legacy_json_path}")
     print("Pipeline finished.")
+
+
+def main() -> None:
+    args = parse_args()
+    config = build_config(args)
+    result = run_pipeline(config, evaluate_requested=args.evaluate, verbose=True)
+    print("[6/6] Writing outputs")
+    write_outputs(result, config)
 
 
 if __name__ == "__main__":
