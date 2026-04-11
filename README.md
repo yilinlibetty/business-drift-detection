@@ -233,8 +233,11 @@ pip install -r requirements.txt
 - numpy
 - scipy
 - matplotlib
+- streamlit
 - openai
 - httpx
+- pyyaml
+- pytest
 
 补充说明：
 
@@ -592,3 +595,41 @@ outputs/experiments/experiment_summary.md
 ```powershell
 pytest -q
 ```
+
+---
+
+## 14. Streamlit frontend and analysis figures
+
+新增研究原型前端入口：
+
+```powershell
+streamlit run streamlit_app.py
+```
+
+前端不做前后端分离，直接复用 `run_pipeline(config)`。当前 v1 支持：
+
+- 上传 `.csv`、`.xes`、`.xml`，或直接使用默认 `datasets/finale.csv` 做 demo。
+- 配置 case id、activity、timestamp、window size、step size、detection mode、score profile、drift metric、MAD multiplier、top-k 和 LLM 开关。
+- 单次运行检测并在页面内保留结果。
+- 展示 summary metrics、drift score timeline、drift point cards、简化 evidence details。
+- 下载 `drift_analysis.json` 和 `final_drift_report.md`。
+
+新增绘图模块位于：
+
+```text
+drift_detection/visualization.py
+```
+
+当前实现的核心图包括：
+
+- Figure 1: drift score timeline，包含 final/trace/duration score、threshold 和 drift point 标注。
+- Figure 2: trace distribution comparison，展示 reference window vs current window 的 Top-K trace 频率变化。
+- Figure 3: activity frequency delta，展示 activity 增减方向。
+- Figure 5: threshold sensitivity，展示不同 `mad_multiplier` 下检测到的 drift point 数量。
+
+加分图按 evidence 可用性显示：
+
+- Figure 4: duration comparison，优先使用 duration samples 画箱线图，否则退回 median/p90/mean summary bars。
+- Figure 6: multi-view radar，基于 `score_contribution` 展示 trace/transition/duration/loop/attribute/core sub-score。
+
+前端展示的 LLM / fallback 诊断仍应理解为 evidence-supported candidate causes，不是已验证事实根因。

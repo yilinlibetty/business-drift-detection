@@ -9,7 +9,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.stats import wasserstein_distance
+
+try:
+    from scipy.stats import wasserstein_distance as _scipy_wasserstein_distance
+except Exception:
+    _scipy_wasserstein_distance = None
 
 from convert_data import load_event_log
 
@@ -132,11 +136,35 @@ def compute_duration_drift(reference_cases: pd.DataFrame, current_cases: pd.Data
     current = current_cases["Duration"].dropna().to_numpy(dtype=float)
     if reference.size == 0 or current.size == 0:
         return 0.0, 0.0
-    raw = float(wasserstein_distance(reference, current))
+    raw = float(_wasserstein_distance(reference, current))
     scale = float(np.median(reference)) if float(np.median(reference)) > 0 else float(np.mean(reference))
     if scale <= 0:
         return raw, raw
     return raw / scale, raw
+
+
+def _wasserstein_distance(reference: np.ndarray, current: np.ndarray) -> float:
+    if _scipy_wasserstein_distance is not None:
+        return float(_scipy_wasserstein_distance(reference, current))
+    return _empirical_wasserstein_distance(reference, current)
+
+
+def _empirical_wasserstein_distance(reference: np.ndarray, current: np.ndarray) -> float:
+    reference = np.sort(np.asarray(reference, dtype=float))
+    current = np.sort(np.asarray(current, dtype=float))
+    reference = reference[~np.isnan(reference)]
+    current = current[~np.isnan(current)]
+    if reference.size == 0 or current.size == 0:
+        return 0.0
+
+    all_values = np.sort(np.concatenate((reference, current)))
+    deltas = np.diff(all_values)
+    if deltas.size == 0:
+        return 0.0
+
+    reference_cdf = np.searchsorted(reference, all_values[:-1], side="right") / reference.size
+    current_cdf = np.searchsorted(current, all_values[:-1], side="right") / current.size
+    return float(np.sum(np.abs(reference_cdf - current_cdf) * deltas))
 
 
 def combine_drift_scores(trace_score: float, duration_score: float, mode: str = "mixed") -> float:

@@ -5,7 +5,10 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from drift_detection.evidence import _validate_tagging_rules, derive_rule_based_tags
+import pandas as pd
+
+from drift_detection.evidence import _validate_tagging_rules, build_evidence_pack, derive_rule_based_tags
+from drift_detection.pipeline import PipelineConfig
 
 
 class TestPathAddedTag:
@@ -168,3 +171,63 @@ class TestTaggingRulesValidation:
 
         with pytest.raises(ValueError, match="attribute_shift_min_delta"):
             _validate_tagging_rules(payload, "test-rules")
+
+
+class TestDurationSamples:
+    def test_evidence_pack_includes_bounded_duration_samples(self):
+        cases = pd.DataFrame(
+            [
+                {
+                    "CaseID": f"C{idx:02d}",
+                    "Activities": ("A", "B"),
+                    "Trace": "A -> B",
+                    "Duration": float(10 + idx),
+                    "RepeatedActivityCount": 0,
+                    "HasLoop": False,
+                    "StartTime": pd.Timestamp("2024-01-01") + pd.Timedelta(hours=idx),
+                    "EndTime": pd.Timestamp("2024-01-01") + pd.Timedelta(hours=idx, minutes=10 + idx),
+                    "CaseIndex": idx,
+                }
+                for idx in range(10)
+            ]
+        )
+        df_events = pd.DataFrame(
+            [
+                {
+                    "Case ID": f"C{idx:02d}",
+                    "Activity": activity,
+                    "Complete Timestamp": pd.Timestamp("2024-01-01") + pd.Timedelta(hours=idx, minutes=offset),
+                }
+                for idx in range(10)
+                for offset, activity in [(0, "A"), (10 + idx, "B")]
+            ]
+        )
+        config = PipelineConfig(
+            file_path="dummy.csv",
+            col_case_id="Case ID",
+            col_activity="Activity",
+            col_timestamp="Complete Timestamp",
+            keep_only_complete=False,
+            top_k=3,
+        )
+        drift_point = {
+            "id": "DP01",
+            "reference_window": {"start_case_index": 0, "end_case_index": 4},
+            "current_window": {"start_case_index": 5, "end_case_index": 9},
+            "score_profile": "trace-duration",
+            "dominant_signal": None,
+            "core_score": 0.5,
+            "trace_score": 0.1,
+            "transition_score": None,
+            "duration_score": 0.5,
+            "loop_score": None,
+            "attribute_score": None,
+        }
+
+        evidence = build_evidence_pack(drift_point, cases, df_events, config)
+        samples = evidence["duration_stats_delta"]["samples"]
+
+        assert samples["reference"] == [10.0, 11.0, 12.0, 13.0, 14.0]
+        assert samples["current"] == [15.0, 16.0, 17.0, 18.0, 19.0]
+        assert samples["truncated"] is False
+        assert samples["max_samples"] == 500

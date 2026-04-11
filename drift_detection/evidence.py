@@ -248,6 +248,7 @@ def _loop_delta(reference_cases: pd.DataFrame, current_cases: pd.DataFrame, regi
 def _duration_delta(reference_cases: pd.DataFrame, current_cases: pd.DataFrame, register) -> dict[str, Any]:
     reference_values = reference_cases["Duration"].to_numpy(dtype=float) if len(reference_cases) else np.asarray([])
     current_values = current_cases["Duration"].to_numpy(dtype=float) if len(current_cases) else np.asarray([])
+    max_samples = 500
 
     def stats(values: np.ndarray) -> dict[str, float]:
         if values.size == 0:
@@ -266,6 +267,12 @@ def _duration_delta(reference_cases: pd.DataFrame, current_cases: pd.DataFrame, 
         "delta": {
             key: round(current_stats[key] - reference_stats[key], 4)
             for key in reference_stats
+        },
+        "samples": {
+            "reference": [float(value) for value in reference_values[:max_samples]],
+            "current": [float(value) for value in current_values[:max_samples]],
+            "max_samples": max_samples,
+            "truncated": bool(reference_values.size > max_samples or current_values.size > max_samples),
         },
     }
     return register(

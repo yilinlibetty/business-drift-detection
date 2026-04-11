@@ -67,6 +67,21 @@ class TestResolveThreshold:
         assert meta.get("mad_multiplier") == 2.5
 
 
+def test_duration_drift_uses_local_wasserstein_fallback(monkeypatch):
+    import pandas as pd
+
+    import drift_detection.pipeline as pipeline_module
+
+    reference_cases = pd.DataFrame({"Duration": [0.0, 1.0]})
+    current_cases = pd.DataFrame({"Duration": [1.0, 2.0]})
+    monkeypatch.setattr(pipeline_module, "_scipy_wasserstein_distance", None)
+
+    normalized, raw = pipeline_module.compute_duration_drift(reference_cases, current_cases)
+
+    assert raw == 1.0
+    assert normalized == 2.0
+
+
 # ── detect_drift_points ──────────────────────────────────────────────────────
 
 class TestDetectDriftPoints:
@@ -174,3 +189,48 @@ class TestDetectDriftPoints:
         }
         assert all(score >= 0.0 for score in signal_scores.values())
         assert row["dominant_signal"] == max(signal_scores.items(), key=lambda item: (item[1], item[0]))[0]
+
+
+def test_run_pipeline_accepts_log_callback(tmp_path):
+    import pandas as pd
+
+    from drift_detection.pipeline import PipelineConfig
+    from run_full_pipeline import run_pipeline
+
+    rows = []
+    for idx in range(20):
+        rows.extend(
+            [
+                {
+                    "Case ID": f"C{idx:03d}",
+                    "Activity": "A",
+                    "Complete Timestamp": pd.Timestamp("2024-01-01") + pd.Timedelta(hours=idx),
+                },
+                {
+                    "Case ID": f"C{idx:03d}",
+                    "Activity": "B",
+                    "Complete Timestamp": pd.Timestamp("2024-01-01") + pd.Timedelta(hours=idx, minutes=5),
+                },
+            ]
+        )
+    csv_path = tmp_path / "events.csv"
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+
+    config = PipelineConfig(
+        file_path=str(csv_path),
+        col_case_id="Case ID",
+        col_activity="Activity",
+        col_timestamp="Complete Timestamp",
+        keep_only_complete=False,
+        window_size=5,
+        step_size=5,
+        threshold=10.0,
+        auto_threshold=False,
+        llm_enabled=False,
+    )
+    logs = []
+    result = run_pipeline(config, evaluate_requested=False, verbose=False, log_callback=logs.append)
+
+    assert result["score_timeline"]
+    assert logs[0].startswith("[1/6] Loading event log")
+    assert any("Running LLM/fallback diagnosis" in message for message in logs)

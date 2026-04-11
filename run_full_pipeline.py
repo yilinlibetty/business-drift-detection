@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from typing import Callable
 
 import pandas as pd
 
@@ -106,8 +107,15 @@ def write_json(path: str, payload: dict) -> None:
         json.dump(serialize_value(payload), handle, indent=2, ensure_ascii=False)
 
 
-def run_pipeline(config: PipelineConfig, evaluate_requested: bool = False, verbose: bool = True) -> dict:
+def run_pipeline(
+    config: PipelineConfig,
+    evaluate_requested: bool = False,
+    verbose: bool = True,
+    log_callback: Callable[[str], None] | None = None,
+) -> dict:
     def log(message: str) -> None:
+        if log_callback is not None:
+            log_callback(message)
         if verbose:
             print(message)
 
