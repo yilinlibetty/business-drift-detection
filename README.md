@@ -613,6 +613,7 @@ streamlit run streamlit_app.py
 - 单次运行检测并在页面内保留结果。
 - 展示 summary metrics、drift score timeline、drift point cards、简化 evidence details。
 - 下载 `drift_analysis.json` 和 `final_drift_report.md`。
+- 下载全部分析图 ZIP，或把图片保存到 `outputs/figures/`。
 
 新增绘图模块位于：
 
@@ -631,5 +632,191 @@ drift_detection/visualization.py
 
 - Figure 4: duration comparison，优先使用 duration samples 画箱线图，否则退回 median/p90/mean summary bars。
 - Figure 6: multi-view radar，基于 `score_contribution` 展示 trace/transition/duration/loop/attribute/core sub-score。
+- Figure 7: score component heatmap，展示 timeline 上各 sub-score 的整体强弱。
+- Figure 8: dominant signal distribution，展示 multi-view 下主要触发信号分布。
+- Figure 9: transition delta，展示 transition 频率变化。
+- Figure 10: attribute delta，展示 resource/team/priority/channel 等属性变化。
+- Figure 11: drift point score breakdown，以柱状图展示单个漂移点的 sub-score 贡献。
+
+如果已经生成了 `outputs/drift_analysis.json`，也可以不打开前端，直接命令行导出论文图：
+
+```powershell
+python export_figures.py
+```
+
+默认输出：
+
+```text
+outputs/figures/
+```
+
+支持导出多种格式：
+
+```powershell
+python export_figures.py --format png --format pdf
+python export_figures.py --input outputs/drift_analysis.json --output-dir outputs/figures --format svg
+```
 
 前端展示的 LLM / fallback 诊断仍应理解为 evidence-supported candidate causes，不是已验证事实根因。
+
+---
+
+## 15. Presentation brief for PPT agent
+
+本节用于直接交给 PPT 制作 agent。目标是帮助其快速理解项目叙事、选择图表、组织 slide，并避免把系统能力表述过度。
+
+### 15.1 One-line pitch
+
+本项目是一个面向业务流程事件日志的 drift detection 原型系统：它不仅检测流程是否发生漂移，还定位漂移区间、提取多视角证据，并生成可复现的候选诊断报告。
+
+推荐英文表述：
+
+> A configurable evidence-driven process drift diagnosis pipeline with multi-view scoring, reproducible experiments, and an interactive Streamlit analysis interface.
+
+推荐中文表述：
+
+> 一个可配置、证据驱动的业务流程漂移诊断系统，结合多视角评分、可复现实验和 Streamlit 可视化前端，支持从事件日志到候选根因报告的完整分析链路。
+
+### 15.2 Core message
+
+PPT 需要强调三点：
+
+- 本项目不是只输出 `DRIFT DETECTED / STABLE`，而是输出漂移时间线、漂移点、证据包和候选诊断。
+- `multi-view` scoring 是当前创新核心：除 trace/duration baseline 外，还引入 transition、loop/rework、attribute/case-mix 等视角。
+- LLM 是可选解释层，不作为主实验依赖；默认 fallback 诊断可复现，且所有候选根因和建议都需要引用 evidence ids。
+
+需要避免的表述：
+
+- 不要说系统已经“证明了真实根因”。
+- 不要说 LLM 诊断是 ground truth。
+- 不要说所有 drift 类型都已经被完美解决；delay drift 仍对 window/threshold 更敏感。
+
+推荐安全表述：
+
+- `candidate root causes`
+- `evidence-supported hypotheses`
+- `diagnostic suggestions for human review`
+- `not validated causal facts`
+
+### 15.3 Suggested slide deck structure
+
+建议做 12-15 页 PPT：
+
+1. Title: Business Drift Detection with Evidence-Driven Diagnosis.
+2. Motivation: 业务流程会随政策、系统、资源、客户组合发生变化，传统 drift detection 往往缺少可解释证据。
+3. Problem Statement: 输入 event log，输出 drift intervals、evidence packs、candidate causes、recommendations、reports and figures。
+4. System Overview: event log input -> case aggregation -> sliding windows -> scoring -> drift point detection -> evidence extraction -> rule/LLM diagnosis -> reports/figures/frontend。
+5. Baseline Scoring: `trace-duration` profile，包含 `trace_score`、`duration_score` 和 `final_score`。
+6. Multi-view Scoring: `trace_score`、`transition_score`、`duration_score`、`loop_score`、`attribute_score`、`core_score`、`dominant_signal`。
+7. Thresholding and Drift Point Construction: MAD threshold 和 drift interval merging。
+8. Evidence Pack: trace、transition、activity、duration、loop/rework、attribute delta，以及 evidence ids。
+9. Diagnosis Layer: rule-based tags first，LLM optional，fallback reproducible，candidate causes must cite evidence ids。
+10. Streamlit Prototype: upload/run/configure/view charts/download JSON/Markdown/figures ZIP。
+11. Experimental Design: `structure`、`delay`、`mixed`、`mixed --drift-segments 2`，比较 `trace-duration` vs `multi-view`。
+12. Key Figures: timeline、trace distribution、activity delta、threshold sensitivity、radar、heatmap、transition/attribute delta。
+13. Results and Discussion: 使用 `outputs/figures/` 与 `outputs/experiments/` 中的结果，讨论 multi-view 优势和限制。
+14. Reproducibility and Engineering: CLI、batch experiments、figure export、Streamlit、pytest。
+15. Limitations and Future Work: 候选根因需业务验证，LLM 非主实验依赖，未来可做 online detection 和 human feedback loop。
+
+### 15.4 Recommended figures for PPT
+
+Figures can be exported by:
+
+```powershell
+python export_figures.py
+```
+
+If using the known working conda environment:
+
+```powershell
+D:\anaconda3\envs\nlp\python.exe export_figures.py
+```
+
+Default output folder:
+
+```text
+outputs/figures/
+```
+
+Recommended PPT figure mapping:
+
+- Method overview slide: create a custom flow diagram from Section 15.3 slide 4.
+- Drift detection result slide: `outputs/figures/figure_01_score_timeline.png`.
+- Threshold robustness slide: `outputs/figures/figure_05_threshold_sensitivity.png`.
+- Multi-view scoring slide: `outputs/figures/figure_07_score_component_heatmap.png`.
+- Drift point evidence slide: `outputs/figures/dp01_figure_02_trace_distribution.png`.
+- Activity evidence slide: `outputs/figures/dp01_figure_03_activity_delta.png`.
+- Duration evidence slide: `outputs/figures/dp01_figure_04_duration_comparison.png`.
+- Multi-view contribution slide: `outputs/figures/dp01_figure_06_multiview_radar.png`.
+- Transition evidence slide: `outputs/figures/dp01_figure_09_transition_delta.png`.
+- Attribute evidence slide: `outputs/figures/dp01_figure_10_attribute_delta.png`.
+- Score breakdown slide: `outputs/figures/dp01_figure_11_score_breakdown.png`.
+
+If a figure says no data is available, skip it for the PPT or explain that the corresponding evidence type was not present in the selected dataset/window.
+
+### 15.5 Demo script for presentation
+
+Recommended live demo flow:
+
+1. Start the frontend:
+
+```powershell
+D:\anaconda3\envs\nlp\python.exe -m streamlit run streamlit_app.py
+```
+
+2. Do not upload a file.
+3. Keep defaults: `datasets/finale.csv`, mode=`mixed`, score profile=`trace-duration`, auto threshold enabled, LLM disabled.
+4. Click `Run drift detection`.
+5. Show the summary cards and Figure 1 timeline.
+6. Open a drift point card.
+7. Open `Evidence details`.
+8. Show trace, activity, duration and radar tabs.
+9. Click `Download figures ZIP` or `Save figures to outputs/figures`.
+10. End by opening the Markdown report or exported figure folder.
+
+Recommended demo narration:
+
+> The frontend is a research prototype, not a production monitoring system. It allows fast single-run analysis while reusing the same pipeline and evidence schema used by the CLI experiments.
+
+### 15.6 Key artifacts and file paths
+
+Core code:
+
+- `run_full_pipeline.py`: CLI pipeline and `run_pipeline(config)`.
+- `drift_detection/pipeline.py`: scoring, thresholding, drift point detection and evaluation.
+- `drift_detection/evidence.py`: evidence pack and rule-based tags.
+- `drift_detection/llm_support.py`: optional LLM diagnosis and fallback.
+- `drift_detection/reporting.py`: Markdown report rendering.
+- `drift_detection/visualization.py`: all Matplotlib figure functions and figure export helpers.
+- `streamlit_app.py`: interactive frontend.
+- `run_experiments.py`: batch ablation experiments.
+- `export_figures.py`: export figures from `drift_analysis.json`.
+
+Main outputs:
+
+- `outputs/drift_analysis.json`: full structured result.
+- `outputs/final_drift_report.md`: readable report.
+- `outputs/drift_score_timeline.csv`: timeline scores.
+- `outputs/experiments/experiment_summary.csv`: batch experiment table.
+- `outputs/experiments/experiment_summary.md`: batch experiment summary.
+- `outputs/figures/`: exported analysis figures.
+
+### 15.7 Suggested visual style for slides
+
+Suggested slide style:
+
+- Use a clean research presentation style rather than a product marketing style.
+- Prefer one key message per slide.
+- Use timeline and evidence charts as the main visual anchors.
+- Use callout boxes for `evidence ids`, `dominant_signal` and `candidate causes`.
+- Keep the wording conservative: diagnosis is evidence-supported, not causally verified.
+
+Suggested color semantics:
+
+- Blue/teal: stable process signal or reference window.
+- Orange/red: current window, drift interval or increased risk.
+- Gray: fallback, caveat or missing data.
+
+### 15.8 Short abstract for PPT intro
+
+This project presents a configurable process drift diagnosis pipeline for business event logs. It transforms event-level logs into case-level behavior, compares adjacent timeline windows, detects drift intervals, and builds evidence packs for each drift point. Beyond a trace-duration baseline, the system supports multi-view scoring over trace, transition, duration, loop/rework and attribute/case-mix signals. A rule-based and optional LLM diagnosis layer converts evidence into candidate root-cause hypotheses and recommendations, while keeping outputs grounded through evidence ids. The project includes reproducible ablation experiments, a Streamlit frontend for interactive analysis, and exportable figures for reporting and presentation.

@@ -12,12 +12,19 @@ import streamlit as st
 from drift_detection.pipeline import PipelineConfig, serialize_value
 from drift_detection.reporting import render_markdown_report
 from drift_detection.visualization import (
+    figures_to_zip_bytes,
     plot_activity_delta,
+    plot_attribute_delta,
+    plot_dominant_signal_distribution,
+    plot_drift_point_score_breakdown,
     plot_duration_comparison,
     plot_multiview_radar,
     plot_score_timeline,
+    plot_score_component_heatmap,
     plot_threshold_sensitivity,
+    plot_transition_delta,
     plot_trace_distribution,
+    save_analysis_figures,
 )
 from run_full_pipeline import run_pipeline
 
@@ -219,12 +226,29 @@ def _render_results(result: dict[str, Any]) -> None:
         mime="text/markdown",
         use_container_width=True,
     )
+    figure_left, figure_right = st.columns(2)
+    figure_left.download_button(
+        "Download figures ZIP",
+        data=figures_to_zip_bytes(result),
+        file_name="drift_analysis_figures.zip",
+        mime="application/zip",
+        use_container_width=True,
+    )
+    if figure_right.button("Save figures to outputs/figures", use_container_width=True):
+        saved_paths = save_analysis_figures(result, output_dir="outputs/figures")
+        st.success(f"Saved {len(saved_paths)} figure file(s) to outputs/figures.")
 
     st.subheader("Figure 1. Drift Score Timeline")
     st.pyplot(plot_score_timeline(result), clear_figure=True)
 
     with st.expander("Figure 5. Threshold sensitivity", expanded=False):
         st.pyplot(plot_threshold_sensitivity(result), clear_figure=True)
+    with st.expander("More global analysis figures", expanded=False):
+        global_tabs = st.tabs(["Score heatmap", "Dominant signal distribution"])
+        with global_tabs[0]:
+            st.pyplot(plot_score_component_heatmap(result), clear_figure=True)
+        with global_tabs[1]:
+            st.pyplot(plot_dominant_signal_distribution(result), clear_figure=True)
 
     st.subheader("Drift Points")
     if not drift_points:
@@ -260,17 +284,31 @@ def _render_drift_point(point: dict[str, Any]) -> None:
         st.markdown(f"**Diagnosis summary:** {diagnosis.get('summary', 'N/A')}")
 
         with st.expander("Evidence details", expanded=False):
-            tab_trace, tab_activity, tab_duration, tab_radar = st.tabs(
-                ["Trace comparison", "Activity delta", "Duration", "Multi-view radar"]
+            tab_trace, tab_activity, tab_transition, tab_attribute, tab_duration, tab_radar, tab_breakdown = st.tabs(
+                [
+                    "Trace comparison",
+                    "Activity delta",
+                    "Transition delta",
+                    "Attribute delta",
+                    "Duration",
+                    "Multi-view radar",
+                    "Score breakdown",
+                ]
             )
             with tab_trace:
                 st.pyplot(plot_trace_distribution(point), clear_figure=True)
             with tab_activity:
                 st.pyplot(plot_activity_delta(point), clear_figure=True)
+            with tab_transition:
+                st.pyplot(plot_transition_delta(point), clear_figure=True)
+            with tab_attribute:
+                st.pyplot(plot_attribute_delta(point), clear_figure=True)
             with tab_duration:
                 st.pyplot(plot_duration_comparison(point), clear_figure=True)
             with tab_radar:
                 st.pyplot(plot_multiview_radar(point), clear_figure=True)
+            with tab_breakdown:
+                st.pyplot(plot_drift_point_score_breakdown(point), clear_figure=True)
 
 
 _CASE_ID_CANDIDATES = ("Case ID", "case_id", "case:concept:name", "case", "id")

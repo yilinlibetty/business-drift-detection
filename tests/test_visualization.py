@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 
 from drift_detection.visualization import (
+    figures_to_zip_bytes,
     plot_activity_delta,
+    plot_attribute_delta,
+    plot_dominant_signal_distribution,
+    plot_drift_point_score_breakdown,
     plot_duration_comparison,
     plot_multiview_radar,
     plot_score_timeline,
+    plot_score_component_heatmap,
     plot_threshold_sensitivity,
+    plot_transition_delta,
     plot_trace_distribution,
+    save_analysis_figures,
 )
 
 
@@ -80,6 +89,14 @@ def _make_point() -> dict:
                 {"activity": "C", "delta": 0.25},
                 {"activity": "B", "delta": -0.20},
             ],
+            "top_changed_transitions": [
+                {"transition": "A -> C", "delta": 0.30},
+                {"transition": "A -> B", "delta": -0.35},
+            ],
+            "attribute_distribution_deltas": [
+                {"attribute": "resource", "value": "R2", "delta": 0.40},
+                {"attribute": "resource", "value": "R1", "delta": -0.40},
+            ],
             "duration_stats_delta": {
                 "reference": {"mean": 10.0, "median": 10.0, "p90": 12.0},
                 "current": {"mean": 22.0, "median": 21.0, "p90": 26.0},
@@ -120,9 +137,14 @@ def test_plot_functions_return_matplotlib_figures():
         plot_score_timeline(result),
         plot_trace_distribution(point),
         plot_activity_delta(point),
+        plot_transition_delta(point),
+        plot_attribute_delta(point),
         plot_threshold_sensitivity(result),
         plot_duration_comparison(point),
         plot_multiview_radar(point),
+        plot_drift_point_score_breakdown(point),
+        plot_score_component_heatmap(result),
+        plot_dominant_signal_distribution(result),
     ]
 
     try:
@@ -139,9 +161,14 @@ def test_plot_functions_handle_missing_data():
         plot_score_timeline(empty_result),
         plot_trace_distribution(empty_point),
         plot_activity_delta(empty_point),
+        plot_transition_delta(empty_point),
+        plot_attribute_delta(empty_point),
         plot_threshold_sensitivity(empty_result),
         plot_duration_comparison(empty_point),
         plot_multiview_radar(empty_point),
+        plot_drift_point_score_breakdown(empty_point),
+        plot_score_component_heatmap(empty_result),
+        plot_dominant_signal_distribution(empty_result),
     ]
 
     try:
@@ -157,3 +184,26 @@ def test_threshold_sensitivity_counts_detected_points():
         assert fig.threshold_sensitivity_counts == [2, 2, 2]
     finally:
         plt.close(fig)
+
+
+def test_save_analysis_figures_exports_pngs(tmp_path):
+    saved_paths = save_analysis_figures(_make_result(), tmp_path)
+
+    assert saved_paths
+    assert all(path.endswith(".png") for path in saved_paths)
+    assert all(Path(path).exists() for path in saved_paths)
+    assert any("figure_01_score_timeline" in path for path in saved_paths)
+    assert any("figure_09_transition_delta" in path for path in saved_paths)
+
+
+def test_figures_to_zip_bytes_contains_expected_names():
+    import zipfile
+    from io import BytesIO
+
+    payload = figures_to_zip_bytes(_make_result())
+
+    assert payload
+    with zipfile.ZipFile(BytesIO(payload)) as archive:
+        names = archive.namelist()
+    assert "figure_01_score_timeline.png" in names
+    assert "dp01_figure_10_attribute_delta.png" in names

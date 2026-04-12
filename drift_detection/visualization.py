@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import math
+from io import BytesIO
+from pathlib import Path
 from typing import Any, Iterable
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import matplotlib
 
@@ -15,6 +18,15 @@ from matplotlib.figure import Figure
 from .pipeline import detect_drift_points, resolve_threshold
 
 DEFAULT_SENSITIVITY_MULTIPLIERS = tuple(round(1.0 + 0.5 * idx, 1) for idx in range(9))
+SCORE_COMPONENT_COLUMNS = (
+    ("final_score", "final"),
+    ("trace_score", "trace"),
+    ("duration_score", "duration"),
+    ("transition_score", "transition"),
+    ("loop_score", "loop"),
+    ("attribute_score", "attribute"),
+    ("core_score", "core"),
+)
 
 
 def plot_score_timeline(result: dict[str, Any]) -> Figure:
@@ -113,6 +125,61 @@ def plot_activity_delta(point: dict[str, Any], top_k: int = 12) -> Figure:
     ax.invert_yaxis()
     ax.set_xlabel("Current frequency - reference frequency")
     ax.set_title("Activity Frequency Delta")
+    ax.grid(True, axis="x", alpha=0.22)
+    fig.tight_layout()
+    return fig
+
+
+def plot_transition_delta(point: dict[str, Any], top_k: int = 12) -> Figure:
+    evidence = point.get("evidence", {}) or {}
+    rows = sorted(
+        evidence.get("top_changed_transitions", []) or [],
+        key=lambda row: abs(_safe_float(row.get("delta")) or 0.0),
+        reverse=True,
+    )[:top_k]
+    if not rows:
+        return _empty_figure("Transition Frequency Delta", "No transition delta evidence is available.")
+
+    labels = [_truncate_label(str(row.get("transition", "N/A")), limit=46) for row in rows]
+    values = [_safe_float(row.get("delta")) or 0.0 for row in rows]
+    colors = ["#2a9d8f" if value >= 0 else "#e76f51" for value in values]
+
+    fig, ax = plt.subplots(figsize=(9.5, max(3.6, len(rows) * 0.40)))
+    ax.barh(np.arange(len(rows)), values, color=colors)
+    ax.set_yticks(np.arange(len(rows)), labels)
+    ax.axvline(0, color="#333333", linewidth=0.9)
+    ax.invert_yaxis()
+    ax.set_xlabel("Current frequency - reference frequency")
+    ax.set_title("Transition Frequency Delta")
+    ax.grid(True, axis="x", alpha=0.22)
+    fig.tight_layout()
+    return fig
+
+
+def plot_attribute_delta(point: dict[str, Any], top_k: int = 12) -> Figure:
+    evidence = point.get("evidence", {}) or {}
+    rows = sorted(
+        evidence.get("attribute_distribution_deltas", []) or [],
+        key=lambda row: abs(_safe_float(row.get("delta")) or 0.0),
+        reverse=True,
+    )[:top_k]
+    if not rows:
+        return _empty_figure("Attribute Distribution Delta", "No attribute distribution evidence is available.")
+
+    labels = [
+        _truncate_label(f"{row.get('attribute', 'attr')}={row.get('value', 'N/A')}", limit=46)
+        for row in rows
+    ]
+    values = [_safe_float(row.get("delta")) or 0.0 for row in rows]
+    colors = ["#2a9d8f" if value >= 0 else "#e76f51" for value in values]
+
+    fig, ax = plt.subplots(figsize=(9.5, max(3.6, len(rows) * 0.40)))
+    ax.barh(np.arange(len(rows)), values, color=colors)
+    ax.set_yticks(np.arange(len(rows)), labels)
+    ax.axvline(0, color="#333333", linewidth=0.9)
+    ax.invert_yaxis()
+    ax.set_xlabel("Current frequency - reference frequency")
+    ax.set_title("Attribute Distribution Delta")
     ax.grid(True, axis="x", alpha=0.22)
     fig.tight_layout()
     return fig
@@ -234,6 +301,155 @@ def plot_multiview_radar(point: dict[str, Any]) -> Figure:
     return fig
 
 
+def plot_drift_point_score_breakdown(point: dict[str, Any]) -> Figure:
+    labels = ["trace", "transition", "duration", "loop", "attribute", "core"]
+    values = [_safe_float(point.get(f"{label}_score"), default=None) for label in labels]
+    rows = [(label, value) for label, value in zip(labels, values) if value is not None]
+    if not rows:
+        return _empty_figure("Drift Point Score Breakdown", "No score contribution is available.")
+
+    row_labels = [label for label, _ in rows]
+    row_values = [value for _, value in rows]
+    colors = ["#1f4e5f" if label in {"trace", "duration", "core"} else "#2a9d8f" for label in row_labels]
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.2))
+    ax.bar(row_labels, row_values, color=colors)
+    ax.set_ylim(0.0, max(1.0, max(row_values) * 1.15))
+    ax.set_title(f"{point.get('id', 'Drift point')} Score Breakdown")
+    ax.set_ylabel("Score")
+    ax.grid(True, axis="y", alpha=0.22)
+    fig.tight_layout()
+    return fig
+
+
+def plot_score_component_heatmap(result: dict[str, Any]) -> Figure:
+    timeline = result.get("score_timeline", []) or []
+    if not timeline:
+        return _empty_figure("Score Component Heatmap", "No score timeline is available.")
+
+    frame = pd.DataFrame(timeline)
+    present_columns = [(column, label) for column, label in SCORE_COMPONENT_COLUMNS if column in frame.columns]
+    present_columns = [
+        (column, label)
+        for column, label in present_columns
+        if any(_safe_float(value, default=None) is not None for value in frame[column].tolist())
+    ]
+    if not present_columns:
+        return _empty_figure("Score Component Heatmap", "No score components are available.")
+
+    labels = [label for _, label in present_columns]
+    matrix = np.asarray(
+        [
+            [_safe_float(value, default=0.0) or 0.0 for value in frame[column].tolist()]
+            for column, _ in present_columns
+        ],
+        dtype=float,
+    )
+
+    fig, ax = plt.subplots(figsize=(11, max(3.6, len(labels) * 0.55)))
+    image = ax.imshow(matrix, aspect="auto", cmap="YlGnBu", interpolation="nearest")
+    x_labels = frame.get("window_id", pd.Series(range(len(frame)))).astype(str).tolist()
+    tick_step = max(1, len(x_labels) // 12)
+    ax.set_xticks(range(0, len(x_labels), tick_step), x_labels[::tick_step], rotation=45, ha="right")
+    ax.set_yticks(range(len(labels)), labels)
+    ax.set_title("Score Component Heatmap")
+    ax.set_xlabel("Timeline window")
+    ax.set_ylabel("Score component")
+    fig.colorbar(image, ax=ax, label="Score")
+    fig.tight_layout()
+    return fig
+
+
+def plot_dominant_signal_distribution(result: dict[str, Any]) -> Figure:
+    timeline = result.get("score_timeline", []) or []
+    signals = [
+        str(row.get("dominant_signal"))
+        for row in timeline
+        if row.get("dominant_signal") not in {None, "", "None"}
+    ]
+    if not signals:
+        return _empty_figure("Dominant Signal Distribution", "No dominant signal data is available.")
+
+    counts = pd.Series(signals).value_counts()
+    fig, ax = plt.subplots(figsize=(7.8, 4.2))
+    ax.bar(counts.index.tolist(), counts.values.tolist(), color="#1f4e5f")
+    ax.set_title("Dominant Signal Distribution")
+    ax.set_xlabel("Dominant signal")
+    ax.set_ylabel("Window count")
+    ax.grid(True, axis="y", alpha=0.22)
+    fig.tight_layout()
+    return fig
+
+
+def build_analysis_figures(result: dict[str, Any]) -> list[tuple[str, Figure]]:
+    figures: list[tuple[str, Figure]] = [
+        ("figure_01_score_timeline", plot_score_timeline(result)),
+        ("figure_05_threshold_sensitivity", plot_threshold_sensitivity(result)),
+        ("figure_07_score_component_heatmap", plot_score_component_heatmap(result)),
+        ("figure_08_dominant_signal_distribution", plot_dominant_signal_distribution(result)),
+    ]
+
+    for point in result.get("drift_points", []) or []:
+        point_id = _safe_filename(str(point.get("id", "drift_point")).lower())
+        figures.extend(
+            [
+                (f"{point_id}_figure_02_trace_distribution", plot_trace_distribution(point)),
+                (f"{point_id}_figure_03_activity_delta", plot_activity_delta(point)),
+                (f"{point_id}_figure_04_duration_comparison", plot_duration_comparison(point)),
+                (f"{point_id}_figure_06_multiview_radar", plot_multiview_radar(point)),
+                (f"{point_id}_figure_09_transition_delta", plot_transition_delta(point)),
+                (f"{point_id}_figure_10_attribute_delta", plot_attribute_delta(point)),
+                (f"{point_id}_figure_11_score_breakdown", plot_drift_point_score_breakdown(point)),
+            ]
+        )
+    return figures
+
+
+def save_analysis_figures(
+    result: dict[str, Any],
+    output_dir: str | Path,
+    formats: Iterable[str] = ("png",),
+    dpi: int = 160,
+) -> list[str]:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    saved_paths: list[str] = []
+    formats = tuple(_safe_filename(str(fmt).lower().lstrip(".")) for fmt in formats)
+
+    for name, fig in build_analysis_figures(result):
+        try:
+            for fmt in formats:
+                if not fmt:
+                    continue
+                path = output_path / f"{_safe_filename(name)}.{fmt}"
+                fig.savefig(path, dpi=dpi, bbox_inches="tight", format=fmt)
+                saved_paths.append(str(path))
+        finally:
+            plt.close(fig)
+    return saved_paths
+
+
+def figures_to_zip_bytes(
+    result: dict[str, Any],
+    formats: Iterable[str] = ("png",),
+    dpi: int = 160,
+) -> bytes:
+    buffer = BytesIO()
+    formats = tuple(_safe_filename(str(fmt).lower().lstrip(".")) for fmt in formats)
+    with ZipFile(buffer, mode="w", compression=ZIP_DEFLATED) as archive:
+        for name, fig in build_analysis_figures(result):
+            try:
+                for fmt in formats:
+                    if not fmt:
+                        continue
+                    figure_buffer = BytesIO()
+                    fig.savefig(figure_buffer, dpi=dpi, bbox_inches="tight", format=fmt)
+                    archive.writestr(f"{_safe_filename(name)}.{fmt}", figure_buffer.getvalue())
+            finally:
+                plt.close(fig)
+    return buffer.getvalue()
+
+
 def _plot_score_series(
     ax: Any,
     x_values: list[float],
@@ -286,6 +502,12 @@ def _safe_float(value: Any, default: float | None = 0.0) -> float | None:
 
 def _truncate_label(value: str, limit: int = 54) -> str:
     return value if len(value) <= limit else f"{value[:limit - 1]}..."
+
+
+def _safe_filename(value: str) -> str:
+    cleaned = "".join(char.lower() if char.isalnum() else "_" for char in value.strip())
+    cleaned = "_".join(part for part in cleaned.split("_") if part)
+    return cleaned or "figure"
 
 
 def _empty_figure(title: str, message: str) -> Figure:
