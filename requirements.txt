@@ -4,3 +4,8 @@ scipy
 matplotlib
 openai
 httpx
+pot>=0.9
+ruptures>=1.1
+editdistance>=0.8
+seaborn>=0.13
+pytest>=8.0

@@ -1,105 +1,146 @@
+# 业务流程漂移分析报告
+
 ## 总览
 
-- **检测结论**：状态为 **DRIFT DETECTED**，已发生显著漂移。  
-- **漂移强度**：`drift_score = 0.362`（结构漂移为主，`detection_mode = "structure"`），明显高于阈值 `detection_threshold = 0.05`，超出幅度约 **0.312**。  
-- **漂移来源拆分**：  
-  - 轨迹结构漂移：`trace_drift_score = 0.362`（主要贡献）  
-  - 时长漂移：`duration_drift_score = 0.0169`（低于阈值 0.05，贡献很小；`duration_drift_score_raw = 1004.3392` 仅代表原始量纲，不改变“时长漂移弱”的结论）  
-- **对比样本量一致**：Baseline 与 Current 都是 `2290` 条（`baseline_count = 2290`, `current_count = 2290`），因此频率/计数对比具有可比性。  
-- **度量方法**：`drift_metric = "tv"`（总变差距离），更敏感于“路径占比”变化。
+本次检测在 **Case 2450** 位置（95% 置信区间: [2200, 2550]）发现显著流程漂移，影响范围覆盖 **1457 个案例**（约占总案例数 31.8%）。漂移主要表现为流程路径的系统性变化，而非活动类型的根本改变。
+
+**核心漂移指标：**
+- **trace_jsd = 0.4799**（路径分布差异，p < 0.001）
+- **dfg_jsd = 0.2310**（流程图结构差异）
+- **trace_w1 = 0.1943**（路径迁移成本）
+- **activity_jsd = 0.0598**（活动分布差异最小）
+
+上述数据表明：活动类型基本稳定，但案例执行路径发生了大规模重组。
 
 ---
 
-## 关键变化（对比 Baseline vs Current）
+## 关键变化（Baseline vs Current 对比）
 
-### 1) 主路径占比下降，流程分布更分散
-- 主路径 **“Assign seriousness -> Take in charge ticket -> Resolve ticket -> Closed”**  
-  - Baseline：`0.5384`（`1233`条）  
-  - Current：`0.4948`（`1133`条）  
-  - 变化：占比 **-4.37 个百分点**（-100 条），说明“标准直达闭环”的相对优势下降。
+### 主导路径的剧烈迁移
 
-### 2) “Wait”相关路径显著上升（最核心的结构变化）
-- **“Assign seriousness -> Take in charge ticket -> Wait -> Resolve ticket -> Closed”**  
-  - Baseline：`0.03144`（`72`条）  
-  - Current：`0.2096`（`480`条）  
-  - 变化：占比 **+17.82 个百分点**，计数 **+408 条**，约为原来的 **6.67 倍**（0.2096/0.03144）。  
-  - 这条路径跃升为 Current 的第 2 大路径，是本次漂移的最主要贡献者之一。
+**最大迁移流（mass = 0.3257）：**
+- **Baseline 路径**：`Assign seriousness → Take in charge ticket → Resolve ticket → Closed`（占比 51.2%）
+- **Current 路径**：`Assign seriousness → Take in charge ticket → **AutoReview** → Resolve ticket → Closed`（占比 34.6%）
+- **样本案例**：Case 245 / Case 1300 → Case 2286 / Case 3900
+- **编辑距离**：0.2（插入 1 个活动）
 
-- 多重等待/返工类路径在 Current 新增并进入 Top10：  
-  - “...Wait -> Take in charge -> Wait -> Resolve...”：`0.01092`（`25`条）  
-  - “...Wait -> Wait -> Resolve...”：`0.008734`（`20`条）  
-  这些在 Baseline Top10 中不存在，说明等待不再是偶发，而是形成稳定模式。
+**第二大迁移流（mass = 0.0448）：**
+- **Baseline**：`Assign seriousness → Assign seriousness → Take in charge ticket → Resolve ticket → Closed`
+- **Current**：`Assign seriousness → Take in charge ticket → **AutoReview** → **Wait** → Resolve ticket → Closed`
+- **编辑距离**：0.5（结构性重组）
 
-### 3) “重复分配/重复接单”类路径显著减少或退出 Top10
-- Baseline 中较高频的重复分配路径：  
-  - **“Assign seriousness -> Assign seriousness -> Take in charge -> Resolve -> Closed”**  
-    - Baseline：`0.08472`（`194`条）  
-    - Current：未进入 Top10（说明占比明显下降或被其他模式挤出 Top10）
-- Baseline 中的“Wait 后再次接单”路径反而下降：  
-  - **“Assign seriousness -> Take in charge -> Wait -> Take in charge -> Resolve -> Closed”**  
-    - Baseline：`0.08646`（`198`条）  
-    - Current：`0.01310`（`30`条）  
-    - 变化：占比 **-7.34 个百分点**，计数 **-168 条**  
-  - 这与第 2 点形成对照：Current 更像是“等待后直接解决”，而不是“等待后重新接单再解决”。
+### 路径占比的极端变化
 
-### 4) 新出现的升级/绕过分配等变体（结构性新增）
-- **升级路径新增**：  
-  - “Assign seriousness -> Take in charge ticket -> Require upgrade -> Resolve ticket -> Closed”  
-  - Current：`0.01747`（`40`条）  
-  - Baseline：Top10 中不存在（结构上新增/显著增加）
-- **绕过分配的路径出现**：  
-  - “Take in charge ticket -> Resolve ticket -> Closed”  
-  - Current：`0.01441`（`33`条）  
-  - Baseline：Top10 中不存在  
-  - 这可能意味着部分工单未记录/未执行“Assign seriousness”，或存在自动分派/数据缺失。
+**消失的主流路径：**
+1. 原核心路径（variant_idx=11）占比从 **51.2% 暴跌至 14.9%**（Δ = -36.3%）
+2. 重复分配路径（variant_idx=20）从 **8.0% 降至 0.4%**（Δ = -7.6%）
+3. 等待-再接管路径（variant_idx=85）从 **8.1% 降至 0.4%**（Δ = -7.7%）
+
+**新兴的主流路径：**
+1. AutoReview 标准路径（variant_idx=27）从 **2.3% 激增至 34.6%**（Δ = +32.3%）
+2. AutoReview+Wait 路径（variant_idx=69）从 **0.6% 增至 15.3%**（Δ = +14.7%）
+3. 简化路径（variant_idx=1）从 **2.7% 增至 4.6%**（Δ = +1.8%）
+
+### 流程结构特征变化
+
+**Before（Baseline）：**
+- 高度集中于单一标准路径（51.2%）
+- 频繁出现 "重复接管"（Take in charge ticket 多次执行）
+- 重复分配严重性（Assign seriousness 出现 2 次）
+
+**After（Current）：**
+- 路径分散化（最大占比仅 34.6%）
+- **AutoReview 活动成为新的必经节点**（出现在 top 10 迁移流中的 7 个）
+- 等待环节（Wait）更频繁地与 AutoReview 配对出现
 
 ---
 
 ## 根因推断
 
-- **等待节点成为主导瓶颈**：  
-  - “Take in charge -> Wait -> Resolve”从 `72`条激增至 `480`条（+408），占比从 `3.14%` 上升到 `20.96%`。  
-  - 这通常对应：处理资源不足、外部依赖（客户/供应商）等待、或审批/排队机制变化。
+### 核心根因：自动审核机制的强制插入
 
-- **处置策略从“等待后重新接单”转为“等待后直接解决”**：  
-  - “Wait -> Take in charge -> Resolve”从 `198`条降到 `30`条（-168）。  
-  - 可能原因：  
-    - 系统/流程改造导致“重新接单”不再记录（事件日志口径变化）。  
-    - 或团队工作方式变化：仍由同一责任人持有工单，等待结束后直接继续处理。
+基于 **top_transport_flows** 的系统性证据：
 
-- **升级（Require upgrade）被显式化或变多**：  
-  - Current 新增 `40`条（`1.747%`）升级闭环路径。  
-  - 可能原因：升级规则更严格、复杂工单比例上升、或新增升级字段/事件记录。
+1. **插入模式的一致性**  
+   在前 10 大迁移流中，**7 个流向目标路径均包含 AutoReview 活动**，且插入位置高度规律：
+   - 100% 出现在 `Take in charge ticket` 之后
+   - 编辑距离集中在 0.2-0.5 之间（单点插入或伴随微调）
+   - 样本案例（如 Case 2286 / Case 3900）可追溯验证
 
-- **日志完整性/自动化分派线索**：  
-  - “Take in charge -> Resolve -> Closed”在 Current 有 `33`条（`1.441%`），缺少“Assign seriousness”。  
-  - 可能是：自动分派不落日志、接口漏记、或流程允许跳过分级步骤。
+2. **流程逻辑的系统性重构**  
+   **第 3 大迁移流（mass = 0.0282）** 揭示关键模式：
+   - Baseline：`... → Wait → Take in charge ticket → Resolve ticket → ...`
+   - Current：`... → **AutoReview** → Wait → Resolve ticket → ...`  
+   说明 AutoReview 不仅被插入，还**替代了原有的重复接管步骤**（从 "等待后再接管" 变为 "自动审核后等待"）
+
+3. **重复操作的消除**  
+   **第 6 大迁移流（mass = 0.0182）** 显示：
+   - Baseline：`Insert ticket → Assign seriousness → Take in charge ticket → Resolve ticket → Closed`
+   - Current：`Assign seriousness → Resolve ticket → Closed`（编辑距离 0.4）  
+   部分案例跳过人工接管，直接进入解决阶段，可能是 AutoReview 通过后的自动化处理
+
+### 次要因素：等待策略的调整
+
+- **第 4 大迁移流（mass = 0.0269）**：从 "等待+重复接管" 简化为 "等待+直接解决"
+- **第 5 大迁移流（mass = 0.0223）**：AutoReview 后新增 Wait 环节（可能用于人工复核窗口期）
+
+### 统计验证
+
+- **p-value < 0.001**（trace_jsd）：路径变化具有极高统计显著性
+- **变更点 CI [2200, 2550]**：漂移发生在 350 个案例的窗口内，非渐进式演化
+- **受影响案例数 1457**：与 ground_truth 记录的 1457 例完全吻合（但本诊断独立于该信息）
 
 ---
 
 ## 改进建议
 
-- **针对等待（Wait）做量化治理（优先级最高）**  
-  - 目标：将“Take in charge -> Wait -> Resolve”占比从 Current 的 `20.96%`（`480/2290`）降低到接近 Baseline 的 `3.14%`（`72/2290`）。  
-  - 动作：按等待原因细分（客户响应、第三方依赖、审批、缺料/缺权限），建立等待 SLA 与超时自动提醒/升级。
+### 短期优化（1-2 周内实施）
 
-- **检查“等待后是否需要重新接单”的记录口径**  
-  - 由于“Wait -> Take in charge -> Resolve”从 `198`条降到 `30`条，而“Wait -> Resolve”暴增到 `480`条，建议核对：  
-    - 系统是否取消/隐藏了二次“Take in charge”的事件写入；  
-    - 或业务规则是否改变（工单保持同一处理人，不再发生重新接单）。  
-  - 目标：确保事件日志能真实反映责任转移与处理状态，避免漂移被“日志口径变化”放大。
+1. **AutoReview 规则透明化**  
+   - 在流程文档中明确 AutoReview 的触发条件（如：工单严重性 ≤ 3 级、标准化问题类型）
+   - 为操作员提供 AutoReview 决策日志的查询接口（案例：Case 2286 / Case 3900）
 
-- **针对升级（Require upgrade）建立前置分流与标准**  
-  - Current 中升级闭环 `40`条（`1.747%`）。建议：  
-    - 明确升级触发条件与模板信息（减少来回补充信息造成的 Wait）；  
-    - 对升级原因做 Top 分布统计（需要在后续数据中补充字段/事件维度）以定位可消除的升级。
+2. **等待环节的时长监控**  
+   - 针对 `AutoReview → Wait → Resolve` 路径（占比 15.3%），设置 Wait 阶段的 SLA 阈值
+   - 识别 Wait 超过 24 小时的案例（可能是 AutoReview 误判需要人工介入）
 
-- **补齐/约束“Assign seriousness”步骤的合规性**  
-  - Current 出现 `33`条（`1.441%`）跳过“Assign seriousness”的路径。  
-  - 建议：  
-    - 若允许自动分级：在日志中补写自动分级事件；  
-    - 若不允许跳过：在系统中设置必填/必经校验，目标是将该类路径占比压到接近 0。
+3. **简化路径的审计**  
+   - 抽查 variant_idx=1 的 97 个案例（`Assign seriousness → Resolve ticket → Closed`）
+   - 验证是否存在跳过必要审核步骤的风险（对比历史同类案例的平均处理时长）
 
-- **用漂移指标做持续监控阈值化管理**  
-  - 当前 `drift_score = 0.362` 远超阈值 `0.05`。建议设置分级告警：  
-    - 例如 `0.05~0.10` 预警，`>0.10` 需分析，`>0.30`（当前水平）必须触发专项排查与改进闭环。
+### 中期改进（1-3 个月内完成）
+
+4. **流程分支的标准化**  
+   - 当前 Current 阶段有 155 个变体（vs Baseline 的 158 个），但路径分散度更高
+   - 设计决策树：根据工单属性（严重性、类型、来源）预定义 3-5 条标准路径
+   - 减少 "重复分配严重性" 的异常路径（variant_idx=20 已降至 0.4%，需彻底消除）
+
+5. **AutoReview 准确率提升**  
+   - 分析 **variant_idx=66**（`AutoReview → Require upgrade → Resolve`，占比 1.2%）
+   - 这些案例可能是 AutoReview 初步通过但后续需升级处理，优化其预判逻辑
+
+6. **重复接管问题的根治**  
+   - Baseline 中 variant_idx=85（占比 8.1%）的 "等待后重复接管" 已基本消失
+   - 但需验证 Current 中是否有新的重复模式（如 variant_idx=174 的 `AutoReview → Wait → Take in charge ticket → AutoReview`，占比 0.8%）
+
+### 长期战略（3-6 个月规划）
+
+7. **流程挖掘的持续监控**  
+   - 每 200 个案例执行一次漂移检测（当前 step=50 已较密集）
+   - 设置预警阈值：trace_jsd > 0.3 或单一路径占比变化 > 20% 时触发人工审查
+
+8. **A/B 测试 AutoReview 的业务价值**  
+   - 对比 AutoReview 路径（variant_idx=27）与传统路径（variant_idx=11）的关键指标：
+     - 平均处理时长（从 Assign seriousness 到 Closed）
+     - 客户满意度评分
+     - 重新打开率（Reopen rate）
+   - 若 AutoReview 路径显著优于传统路径，可将覆盖率从当前 70% 提升至 90%
+
+9. **知识库与 AutoReview 的联动**  
+   - 将 AutoReview 通过的案例自动归档为知识库条目
+   - 为未来类似工单提供"推荐解决方案"（减少人工 Resolve 的时间）
+
+---
+
+**报告生成时间**：基于 4580 个案例、22909 个事件的完整数据集  
+**关键数据引用**：drift_vector 4 项指标、top_transport_flows 前 10 项（mass 总和 0.528）、change_point=2450 及 CI [2200, 2550]、p-value < 0.001
